@@ -1,5 +1,8 @@
 # Ignore virtual environment
 Bambu2OBS/
+.venv/
+b2obsvenv/
+venv/
 
 # Ignore environment variables
 .env
@@ -19,3 +22,11 @@ __pycache__/
 .vscode/
 .idea/
 *.swp
+
+# Build and test output
+build/
+dist/
+native/build*/
+*.egg-info/
+.coverage
+htmlcov/

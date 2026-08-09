@@ -106,6 +106,24 @@ class ProgressbarServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("preview_image_url", payload)
         self.assertEqual(payload["preview_image_url"], "/print-preview-image")
+        self.assertIn("runtime", payload)
+        self.assertIn("telemetry", payload)
+
+    def test_job_info_includes_runtime_and_telemetry(self):
+        self._write("remaining_time.txt", "-1h20m")
+        self._write("layerOverview.txt", "Layer: 10 / 80")
+        self._write(
+            "writerStatus.json",
+            '{"state":"mqtt_message_received","updated_at":"2026-01-01T00:00:00Z"}'
+        )
+
+        response = self.client.get("/job-info")
+        payload = response.get_json()
+
+        self.assertEqual(payload["telemetry"]["remaining_time"], "-1h20m")
+        self.assertEqual(payload["telemetry"]["layer"], "Layer: 10 / 80")
+        self.assertEqual(payload["runtime"]["display_state"], "live")
+        self.assertFalse(payload["runtime"]["stale"])
 
     def test_print_preview_image_returns_placeholder_when_missing(self):
         response = self.client.get("/print-preview-image")
@@ -121,6 +139,15 @@ class ProgressbarServerTests(unittest.TestCase):
         try:
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.data, b"mock-png-bytes")
+        finally:
+            response.close()
+
+    def test_print_preview_image_uses_detected_image_mime(self):
+        self._write_bytes("printCover.png", b"\xff\xd8\xffmock-jpeg")
+
+        response = self.client.get("/print-preview-image")
+        try:
+            self.assertEqual(response.mimetype, "image/jpeg")
         finally:
             response.close()
 
@@ -171,6 +198,20 @@ class ProgressbarServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"/print-preview-image", response.data)
         self.assertIn(b"id=\"print-preview\"", response.data)
+
+    def test_progressbar_view_is_self_contained_and_has_status_fields(self):
+        response = self.client.get("/view/progressbar")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(b"stackpath.bootstrapcdn.com", response.data)
+        self.assertIn(b"id=\"status-pill\"", response.data)
+        self.assertIn(b"id=\"progress-value\"", response.data)
+
+    def test_json_responses_disable_caching_without_global_cors(self):
+        response = self.client.get("/job-info", headers={"Origin": "https://example.com"})
+
+        self.assertIn("no-store", response.headers["Cache-Control"])
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)
 
     def test_writer_diagnostics_missing_status_file(self):
         response = self.client.get("/diagnostics/writer")

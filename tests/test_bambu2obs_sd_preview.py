@@ -7,7 +7,8 @@ import time
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,8 @@ if str(SRC_DIR) not in sys.path:
 
 
 class SdPreviewFallbackTests(unittest.TestCase):
+    PNG_BYTES = b"\x89PNG\r\n\x1a\nmock-image-data"
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.previous_base_dir = os.environ.get("BASE_DIR")
@@ -37,6 +40,19 @@ class SdPreviewFallbackTests(unittest.TestCase):
         self.temp_dir.cleanup()
         if "bambu2obs" in sys.modules:
             del sys.modules["bambu2obs"]
+
+    def _write(self, filename: str, content: str):
+        path = Path(self.temp_dir.name) / filename
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def _image_response(self):
+        response = MagicMock()
+        response.ok = True
+        response.status_code = 200
+        response.headers = {"Content-Length": str(len(self.PNG_BYTES))}
+        response.iter_content.return_value = [self.PNG_BYTES]
+        return response
 
     def test_extract_preview_name_candidates_ignores_internal_plate_name(self):
         task_data = {"title": "Cube.gcode.3mf"}
@@ -72,14 +88,14 @@ class SdPreviewFallbackTests(unittest.TestCase):
     def test_extract_preview_bytes_from_3mf_prefers_plate_image(self):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
-            archive.writestr("Metadata/top_1.png", b"top-image")
-            archive.writestr("Metadata/plate_1.png", b"plate-image")
-            archive.writestr("Metadata/pick_1.png", b"pick-image")
+            archive.writestr("Metadata/top_1.png", self.PNG_BYTES + b"-top")
+            archive.writestr("Metadata/plate_1.png", self.PNG_BYTES + b"-plate")
+            archive.writestr("Metadata/pick_1.png", self.PNG_BYTES + b"-pick")
 
         preview_bytes, preview_member = self.module._extract_preview_bytes_from_3mf(buffer.getvalue())
 
         self.assertEqual(preview_member, "Metadata/plate_1.png")
-        self.assertEqual(preview_bytes, b"plate-image")
+        self.assertEqual(preview_bytes, self.PNG_BYTES + b"-plate")
 
     def test_extract_preview_bytes_from_3mf_returns_none_when_missing(self):
         buffer = io.BytesIO()
@@ -101,7 +117,7 @@ class SdPreviewFallbackTests(unittest.TestCase):
             "gcode_file": "/data/Metadata/plate_2.gcode"
         }
 
-        with patch.object(self.module, "attempt_sdcard_preview_fallback", return_value=False) as fallback_mock:
+        with patch.object(self.module, "request_sdcard_preview_fallback", return_value=False) as fallback_mock:
             self.module.handle_print_data(print_data)
 
         fallback_mock.assert_called_once()
@@ -124,7 +140,7 @@ class SdPreviewFallbackTests(unittest.TestCase):
             "gcode_file": "/data/Metadata/plate_4.gcode"
         }
 
-        with patch.object(self.module, "attempt_sdcard_preview_fallback", return_value=False):
+        with patch.object(self.module, "request_sdcard_preview_fallback", return_value=False):
             self.module.handle_print_data(print_data)
 
         self.assertFalse(Path(self.module.PRINT_COVER_IMAGE_PATH).exists())
@@ -161,6 +177,144 @@ class SdPreviewFallbackTests(unittest.TestCase):
             urls,
             ["https://example.com/cover.png", "https://example.com/thumb.png"]
         )
+
+    def test_successful_sd_preview_is_not_downloaded_again_after_retry_interval(self):
+        with self.module.sd_preview_lock:
+            self.module.sd_preview_attempt_state.update({
+                "job_key": "same-job",
+                "attempted_at": time.time() - self.module.SD_PREVIEW_RETRY_SECONDS - 1,
+                "success": True
+            })
+
+        self.assertFalse(self.module._should_attempt_sd_preview("same-job", force=False))
+
+    def test_failed_sd_preview_can_retry_after_interval(self):
+        with self.module.sd_preview_lock:
+            self.module.sd_preview_attempt_state.update({
+                "job_key": "same-job",
+                "attempted_at": time.time() - self.module.SD_PREVIEW_RETRY_SECONDS - 1,
+                "success": False
+            })
+
+        self.assertTrue(self.module._should_attempt_sd_preview("same-job", force=False))
+
+    def test_sd_preview_only_runs_for_active_local_prints(self):
+        self.assertTrue(self.module.is_active_local_print({"print_type": "local", "gcode_state": "RUNNING"}))
+        self.assertTrue(self.module.is_active_local_print({"print_type": "lan", "gcode_state": "PAUSE"}))
+        self.assertFalse(self.module.is_active_local_print({"print_type": "cloud", "gcode_state": "RUNNING"}))
+        self.assertFalse(self.module.is_active_local_print({"print_type": "local", "gcode_state": "IDLE"}))
+        self.assertFalse(self.module.is_active_local_print({}))
+
+    def test_numeric_print_stage_uses_pybambu_integer_mapping(self):
+        with (
+            patch.object(self.module, "write_to_file") as write_mock,
+            patch.object(self.module, "request_sdcard_preview_fallback")
+        ):
+            self.module.handle_print_data({"mc_print_stage": "2"})
+
+        self.assertIn(call("printStage", self.module.CURRENT_STAGE_IDS[2]), write_mock.call_args_list)
+
+    def test_multiple_ams_units_receive_distinct_canonical_filenames(self):
+        print_data = {
+            "ams": {
+                "ams": [
+                    {"id": "0", "tray": [{"id": "0", "tray_info_idx": "GFB00", "tray_color": "FF0000"}]},
+                    {"id": "1", "tray": [{"id": "0", "tray_info_idx": "GFB01", "tray_color": "00FF00"}]}
+                ]
+            }
+        }
+
+        with patch.object(self.module, "write_to_file") as write_mock:
+            self.module.handle_print_data(print_data)
+
+        written_names = [args.args[0] for args in write_mock.call_args_list]
+        self.assertIn("ams1Tray1FilamentId", written_names)
+        self.assertIn("ams2Tray1FilamentId", written_names)
+        self.assertIn("ams1FilamentId", written_names)
+
+    def test_svg_outputs_follow_custom_base_dir(self):
+        self._write("ams1FilamentColor.txt", "FF0000")
+        self._write("activeAmsTray.txt", "1")
+
+        self.module.update_svg_with_all_tray_colors()
+
+        self.assertTrue((Path(self.temp_dir.name) / "Filaments.svg").exists())
+        self.assertTrue((Path(self.temp_dir.name) / "ActiveFilament.svg").exists())
+
+    def test_preview_url_rejects_plain_http_and_private_ip(self):
+        with self.assertRaises(ValueError):
+            self.module.validate_remote_preview_url("http://example.com/cover.png")
+        with self.assertRaises(ValueError):
+            self.module.validate_remote_preview_url("https://127.0.0.1/cover.png")
+
+    def test_save_print_cover_rejects_non_image_bytes(self):
+        saved = self.module.save_print_cover_image(b"not-an-image", "test")
+
+        self.assertFalse(saved)
+        self.assertFalse(Path(self.module.PRINT_COVER_IMAGE_PATH).exists())
+
+    def test_external_preview_download_never_receives_bearer_token(self):
+        response = self._image_response()
+        cloud = SimpleNamespace(
+            session=MagicMock(),
+            auth_token="top-secret-token",
+            region="global",
+            login=MagicMock()
+        )
+
+        with patch.object(self.module.requests, "get", return_value=response) as request_mock:
+            image_bytes, mode = self.module.download_cloud_preview_image(
+                cloud,
+                "https://cdn.example.com/cover.png?signature=secret"
+            )
+
+        self.assertEqual(image_bytes, self.PNG_BYTES)
+        self.assertEqual(mode, "plain")
+        self.assertIsNone(request_mock.call_args.kwargs["headers"])
+        cloud.session.get.assert_not_called()
+
+    def test_bambu_api_preview_can_receive_bearer_token(self):
+        response = self._image_response()
+        session = MagicMock()
+        session.get.return_value = response
+        cloud = SimpleNamespace(
+            session=session,
+            auth_token="top-secret-token",
+            region="global",
+            login=MagicMock()
+        )
+
+        image_bytes, mode = self.module.download_cloud_preview_image(
+            cloud,
+            "https://api.bambulab.com/preview/cover.png"
+        )
+
+        self.assertEqual(image_bytes, self.PNG_BYTES)
+        self.assertEqual(mode, "authorized")
+        self.assertEqual(
+            session.get.call_args.kwargs["headers"],
+            {"Authorization": "Bearer top-secret-token"}
+        )
+
+    def test_archive_member_count_is_bounded(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("Metadata/plate_1.png", self.PNG_BYTES)
+            archive.writestr("Metadata/extra.png", self.PNG_BYTES)
+
+        with patch.object(self.module, "MAX_3MF_MEMBER_COUNT", 1):
+            with self.assertRaisesRegex(ValueError, "more than 1 members"):
+                self.module._extract_preview_bytes_from_3mf(buffer.getvalue())
+
+    def test_diagnostic_redaction_removes_nested_secrets(self):
+        redacted = self.module.redact_diagnostic_data({
+            "token": "secret-token",
+            "device": {"access_code": "12345678", "state": "RUNNING"}
+        })
+
+        self.assertEqual(redacted["token"], "<redacted>")
+        self.assertEqual(redacted["device"]["access_code"], "<redacted>")
+        self.assertEqual(redacted["device"]["state"], "RUNNING")
 
 
 if __name__ == "__main__":

@@ -154,7 +154,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/BambuVenv/assets/amstray1_1_id.txt",
+                "file": "C:/Bambu2OBS_project/data/ams1FilamentId.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Bold",
@@ -187,7 +187,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/BambuVenv/assets/amstray1_2_id.txt",
+                "file": "C:/Bambu2OBS_project/data/ams2FilamentId.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Bold",
@@ -220,7 +220,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/BambuVenv/assets/amstray1_3_id.txt",
+                "file": "C:/Bambu2OBS_project/data/ams3FilamentId.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Bold",
@@ -253,7 +253,7 @@
             "versioned_id": "text_gdiplus_v2",
             "settings": {
                 "read_from_file": true,
-                "file": "C:/BambuVenv/assets/amstray1_3_id.txt",
+                "file": "C:/Bambu2OBS_project/data/ams4FilamentId.txt",
                 "font": {
                     "face": "Arial",
                     "style": "Bold",

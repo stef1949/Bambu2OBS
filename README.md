@@ -1,112 +1,162 @@
 # Bambu2OBS
 
-## Overview
-Bambu2OBS is a tool that connects your Bambu Lab 3D printer to OBS Studio, allowing you to monitor and display real-time print progress directly in OBS. Ideal for content creators who want to showcase live 3D printing projects or create timelapses with accurate status updates.
+Bambu2OBS connects a Bambu Lab 3D printer to OBS Studio and displays live print progress, job metadata, temperatures, layers, speed, and preview artwork.
 
-This project integrates Bambu 3D printers with OBS Studio, offering real-time monitoring and display of printing progress. It uses local printer MQTT/FTPS for live status and the `bambu-lab-cloud-api` client for cloud task metadata (profile name, cover image, etc.), with Flask serving dynamic overlay content.
+The currently runnable release is a Windows-friendly Python companion application. It connects to the printer over local MQTT and FTPS, optionally uses Bambu Cloud for job metadata, and serves a local OBS Browser Source. A native OBS source is being developed under [`native/`](native/) so the final release can run without Python, Flask, localhost, or a Browser Source.
 
-You can watch live demonstrations of this setup on my [Twitch channel](https://www.twitch.tv/fluidprints), where I monitor my 3D prints.
+## Current features
 
+- Local MQTT telemetry with bounded reconnect backoff.
+- Optional Bambu Cloud job name and preview retrieval.
+- SD-card `.3mf` preview fallback with archive and image safety limits.
+- Consolidated, transparent progress overlay with live/stale/offline status.
+- Temperatures, layer count, remaining time, stage, speed, and print artwork.
+- Multiple AMS units in the output data model, with legacy aliases for the first AMS.
+- Atomic state writes so OBS and Flask do not read partially written files.
+- TLS certificate pinning for self-signed printer services.
 
-### Features
-- Real-time status updates on printing progress
-- SVG integration for visualizing print data
-- Configurable through environment variables for easy setup
+## Requirements
 
-## Setup and Installation
+- Windows 10 or 11.
+- Python 3.11 or newer.
+- OBS Studio.
+- A Bambu printer with LAN access enabled.
 
-### Prerequisites
+Inkscape, VS Code, and Bambu Cloud are not required at runtime.
 
-- Python 3.x installed on your system
-- OBS Studio for display integration
-- InkScape for SVG manipulation
+## Install the current Python version
 
-### Setting up a Virtual Environment
+Open PowerShell in the repository directory:
 
-It's recommended to use a virtual environment for Python projects to manage dependencies efficiently. Follow these steps to set up and activate a virtual environment:
-
-1. Open a terminal or command prompt.
-2. Navigate to your project directory:
-
-    ```bash
-    cd path/to/Bambu2OBS
-    ```
-
-3. Create a virtual environment named `venv` (or any other name you prefer):
-
-    ```bash
-    python -m venv b2obsvenv
-    ```
-
-4. Activate the virtual environment:
-
-    - On Windows:
-
-        ```bash
-        .\b2obsvenv\Scripts\activate
-        ```
-
-    - On macOS and Linux:
-
-        ```bash
-        source b2obsvenv/bin/activate
-        ```
-
-### Installing Dependencies
-
-With the virtual environment activated, install the required Python packages using:
-
-```bash
-pip install -r requirements.txt
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+Copy-Item example.env .env
 ```
 
-### Configuration
-Copy `example.env` to `.env` and adjust the configuration parameters according to your environment and Bambu printer settings.
+Edit `.env` and set at least:
 
-In order to connect to your Bambu printer, set the following environment variables in `.env`:
+```dotenv
+PRINTER_SN=your_printer_serial_number
+PRINTER_IP=192.0.2.10
+ACCESS_CODE=your_access_code
+BASE_DIR=data
+```
 
-- **EMAIL**: Your Bambu Cloud account email.
-- **PASSWORD**: Your Bambu Cloud account password.
-- **REGION**: Set to `china` if using the Chinese Bambu Cloud; otherwise set to `global`.
-- **PRINTER_SN**: The serial number of your Bambu Lab printer.
-- **PRINTER_IP**: The IP address of your printer on your local network.
-- **ACCESS_CODE**: Access code from your printer settings.
-- **BASE_DIR**: Name of the folder that will store the print job data used for overlays.
-- **BAMBU_CLOUD_TOKEN**: Optional but recommended cloud token. This avoids interactive verification-code (2FA) login issues in unattended runs.
+`EMAIL`, `PASSWORD`, and `BAMBU_CLOUD_TOKEN` are optional. LAN telemetry continues to work when cloud authentication is unavailable.
 
-If `BAMBU_CLOUD_TOKEN` is empty, Bambu2OBS will attempt login with `EMAIL` + `PASSWORD`. Accounts that require verification-code login should set `BAMBU_CLOUD_TOKEN`.
+## Choose a printer TLS trust mode
 
-### Running the Application
-1. Start the Flask server:
+Bambu printer LAN services commonly use a self-signed certificate. Choose one of these modes explicitly.
 
-    ```bash
-    python .\src\bambu2obs.py
-    ```
+### Preferred: pin the printer certificate
 
-2. Configure OBS Studio to display the progress bar and SVGs by adding browser sources pointing to the Flask server's URLs.
+Set `PRINTER_TLS_FINGERPRINT_SHA256` to the 64-character SHA-256 fingerprint of the printer certificate. Colons and letter case are ignored.
 
-### Importing the OBS Scene
+The following PowerShell obtains the certificate presented by MQTT port 8883. Review that you are connected to the intended printer before trusting the value:
 
-To make it easier to set up Bambu2OBS in OBS Studio, you can import the pre-configured OBS scene:
+```powershell
+$printerAddress = '192.0.2.10'
+$tcpClient = [Net.Sockets.TcpClient]::new($printerAddress, 8883)
+$acceptCertificate = { param($sender, $certificate, $chain, $errors) $true }
+$tlsStream = [Net.Security.SslStream]::new($tcpClient.GetStream(), $false, $acceptCertificate)
+$tlsStream.AuthenticateAsClient($printerAddress)
+$certificateBytes = $tlsStream.RemoteCertificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+$fingerprint = [Security.Cryptography.SHA256]::HashData($certificateBytes)
+[Convert]::ToHexString($fingerprint)
+$tlsStream.Dispose()
+$tcpClient.Dispose()
+```
 
-1. Download the scene file from the `obs_templates/Bambu2OBS_Scene.json` in this repository.
-2. Open OBS Studio.
-3. Go to **Scene Collection > Import** and select the downloaded `.json` file.
-4. Adjust any necessary settings (e.g., URLs or local paths) within the imported scene to match your setup, especially pointing to the Flask server’s URL for live data.
+Copy the result into `.env`:
 
-This imported scene provides an easy way to visualize your print progress in OBS with minimal setup.
+```dotenv
+PRINTER_TLS_FINGERPRINT_SHA256=0123456789ABCDEF...
+ALLOW_INSECURE_PRINTER_TLS=false
+```
 
-![Bambu2OBS OBS Scene Example](images/obs_scene_example.png)
+### Compatibility exception
 
-### Attribution
-This project is open-source under the MIT License. If you use or adapt Bambu2OBS, please provide credit to [fluidman](https://github.com/fluidman) and reference this repository.
+If pinning is not currently possible, the following explicit exception retains encryption but does not verify printer identity:
 
-Special thanks to Greg Hesp for the `pybambu` library, which facilitates communication with Bambu 3D printers. GitHub repository: [pybambu](https://github.com/greghesp/pybambu).
+```dotenv
+PRINTER_TLS_FINGERPRINT_SHA256=
+ALLOW_INSECURE_PRINTER_TLS=true
+```
 
-Cloud API integration is powered by [coelacant1/Bambu-Lab-Cloud-API](https://github.com/coelacant1/Bambu-Lab-Cloud-API).
+Use this only on a trusted private network. See [SECURITY.md](SECURITY.md).
 
-### License
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+## Optional cloud metadata
 
-## About
-Bambu2OBS is designed for OBS Studio users who want to display live updates from Bambu Lab 3D printers. This tool supports most Bambu printer models and works best with OBS Studio and Flask, providing a flexible solution for showcasing real-time print progress in streaming setups.
+For unattended use, prefer a token:
+
+```dotenv
+REGION=global
+BAMBU_CLOUD_TOKEN=your_token
+```
+
+If the token is empty, the application can try `EMAIL` and `PASSWORD`. Accounts requiring an interactive verification code should use a token. Cloud credentials are never sent to third-party preview hosts.
+
+## Run
+
+With the virtual environment activated:
+
+```powershell
+python .\src\bambu2obs.py
+```
+
+The process starts the local overlay server, checks that it is listening, obtains initial metadata, and then enters the MQTT loop. Stop it with `Ctrl+C`.
+
+The server listens only on `127.0.0.1`. Its port defaults to `5000` and can be changed with `PROGRESS_SERVER_PORT`.
+
+## Add the overlay to OBS
+
+Add a Browser Source using one of these local URLs:
+
+- Consolidated overlay: `http://127.0.0.1:5000/view/progressbar`
+- Print artwork only: `http://127.0.0.1:5000/view/printpreview`
+- AMS overview: `http://127.0.0.1:5000/view/Filaments.svg`
+- Active filament: `http://127.0.0.1:5000/view/ActiveFilament.svg`
+
+Use a transparent Browser Source and choose dimensions appropriate for the scene; `760 × 180` is a practical starting point for the consolidated overlay.
+
+The file at [`obs_template/Bambu2OBS_Scene.json`](obs_template/Bambu2OBS_Scene.json) is a legacy example containing machine-specific paths. It is not the recommended installation method and will be replaced by the native single-source workflow.
+
+## Diagnostics
+
+While the application is running:
+
+- `http://127.0.0.1:5000/diagnostics/progress`
+- `http://127.0.0.1:5000/diagnostics/writer`
+
+The overlay marks data stale after 30 seconds by default. Change this with `OVERLAY_STALE_AFTER_SECONDS`.
+
+`DEBUG_DUMPS=true` stores at most five diagnostic MQTT entries. Common credential fields are redacted, but always inspect diagnostics before sharing them.
+
+## Test
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m compileall -q src tests
+python -m unittest discover -s tests -v
+python -m pip check
+python -m ruff check src tests
+```
+
+CI runs the same checks on supported Python versions. Printer, cloud-account, and OBS integration still require proportional live testing because unit tests do not contain real credentials or hardware access.
+
+## Native OBS plugin development
+
+The native source foundation is kept separate from the working Python implementation until feature parity is demonstrated. See [`native/README.md`](native/README.md) and [`OVERLAY_OVERHAUL_PROMPT.md`](OVERLAY_OVERHAUL_PROMPT.md) for architecture, build, security, packaging, and acceptance requirements.
+
+Do not distribute a native build as production-ready until it has been built against a supported OBS version, loaded in OBS, tested during reconnect/shutdown, and validated with a real printer or sanitized protocol fixtures.
+
+## Attribution and license
+
+Bambu2OBS is based on the original work by [fluidman](https://github.com/fluidman). Local printer mappings use [Greg Hesp's pybambu](https://github.com/greghesp/pybambu), and optional cloud integration uses [coelacant1/Bambu-Lab-Cloud-API](https://github.com/coelacant1/Bambu-Lab-Cloud-API).
+
+The existing repository is licensed under the MIT License; see [LICENSE](LICENSE). Native OBS plugin distribution has additional GPL compatibility requirements that must be resolved before release because the plugin links against libobs.
+
+Direct dependency licence metadata and outstanding release-review requirements are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

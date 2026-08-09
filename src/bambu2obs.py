@@ -2,6 +2,8 @@ from dotenv import load_dotenv
 import os
 import ssl
 import ftplib
+import hashlib
+import ipaddress
 from pybambu.const import SPEED_PROFILE, FILAMENT_NAMES, CURRENT_STAGE_IDS
 import paho.mqtt.client as mqtt
 import json
@@ -9,15 +11,18 @@ import threading
 import io
 import zipfile
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 import socket
 import subprocess
-import signal
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+import requests
 
 try:
     from bambulab import (
@@ -34,6 +39,37 @@ except ImportError:
 
 # Load environment variables
 load_dotenv()
+
+TRUE_VALUES = {'1', 'true', 'yes', 'on'}
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable with a safe default."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in TRUE_VALUES
+
+
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read a bounded integer environment variable without failing at import time."""
+    raw_value = os.getenv(name)
+    if raw_value in (None, ''):
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        print(f"Ignoring invalid {name}={raw_value!r}; using {default}.")
+        return default
+    if not minimum <= value <= maximum:
+        print(f"Ignoring out-of-range {name}={value}; using {default}.")
+        return default
+    return value
+
+
+def normalize_sha256_fingerprint(value: str | None) -> str | None:
+    normalized = re.sub(r'[^0-9a-f]', '', str(value or '').lower())
+    return normalized if len(normalized) == 64 else None
 
 # Additional global variable to track the first run
 is_first_run = True
@@ -68,7 +104,15 @@ BASE_DIR = resolve_base_dir()
 # Optional pre-fetched cloud auth token to bypass password/2FA login flows
 CLOUD_AUTH_TOKEN = os.getenv('BAMBU_CLOUD_TOKEN')
 # Enable message dumps only when explicitly set
-DEBUG_DUMPS = os.getenv('DEBUG_DUMPS', '').lower() in ('1', 'true', 'yes', 'on', 'debug')
+DEBUG_DUMPS = env_bool('DEBUG_DUMPS')
+PRINTER_TLS_FINGERPRINT_SHA256 = normalize_sha256_fingerprint(
+    os.getenv('PRINTER_TLS_FINGERPRINT_SHA256')
+)
+ALLOW_INSECURE_PRINTER_TLS = env_bool('ALLOW_INSECURE_PRINTER_TLS')
+MAX_PREVIEW_IMAGE_BYTES = env_int('MAX_PREVIEW_IMAGE_BYTES', 10 * 1024 * 1024, 1024, 100 * 1024 * 1024)
+MAX_3MF_ARCHIVE_BYTES = env_int('MAX_3MF_ARCHIVE_BYTES', 256 * 1024 * 1024, 1024, 2 * 1024 * 1024 * 1024)
+MAX_3MF_MEMBER_COUNT = env_int('MAX_3MF_MEMBER_COUNT', 4096, 1, 100000)
+PROGRESS_SERVER_PORT = env_int('PROGRESS_SERVER_PORT', 5000, 1024, 65535)
 
 # Define the path for persisted files in the data subdirectory
 DUMPS_FILE_PATH = os.path.join(BASE_DIR, 'ConnectionDumps.json')
@@ -76,13 +120,15 @@ TASK_ID_FILE_PATH = os.path.join(BASE_DIR, 'latest_task_id.txt')
 WRITER_STATUS_FILE_PATH = os.path.join(BASE_DIR, 'writerStatus.json')
 PRINT_COVER_IMAGE_PATH = os.path.join(BASE_DIR, 'printCover.png')
 PRINT_COVER_LEGACY_PATH = os.path.join(BASE_DIR, 'printcover.png')
-CONNECTION_DUMPS_MAX_ENTRIES = 50
+CONNECTION_DUMPS_MAX_ENTRIES = 5
 connection_dumps = deque(maxlen=CONNECTION_DUMPS_MAX_ENTRIES)
 writer_status_lock = threading.Lock()
 sd_preview_lock = threading.Lock()
+background_tasks_lock = threading.Lock()
+background_tasks = {}
 latest_print_data = {}
 sd_preview_attempt_state = {"job_key": None, "attempted_at": 0.0, "success": False}
-SD_PREVIEW_RETRY_SECONDS = int(os.getenv('SD_PREVIEW_RETRY_SECONDS', '45'))
+SD_PREVIEW_RETRY_SECONDS = env_int('SD_PREVIEW_RETRY_SECONDS', 45, 5, 3600)
 SD_PREVIEW_ARCHIVE_SUFFIX = '.3mf'
 SD_PREVIEW_PRIORITY_MEMBERS = (
     'Metadata/plate_1.png',
@@ -100,16 +146,169 @@ writer_status = {
     "write_count": 0
 }
 
+
+def atomic_write_bytes(path: str, content: bytes):
+    """Atomically replace a file so readers never observe partial contents."""
+    target_dir = os.path.dirname(os.path.abspath(path))
+    os.makedirs(target_dir, exist_ok=True)
+    file_descriptor, temp_path = tempfile.mkstemp(
+        dir=target_dir,
+        prefix=f".{os.path.basename(path)}.",
+        suffix='.tmp'
+    )
+    try:
+        with os.fdopen(file_descriptor, 'wb') as temp_file:
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def atomic_write_text(path: str, content: str):
+    atomic_write_bytes(path, content.encode('utf-8'))
+
+
+def atomic_write_json(path: str, content):
+    serialized = json.dumps(content, ensure_ascii=False, indent=2)
+    atomic_write_text(path, serialized)
+
+
+def redact_url(value: str) -> str:
+    """Remove credentials, query strings, and fragments before logging a URL."""
+    try:
+        parsed = urlsplit(str(value))
+    except ValueError:
+        return '<invalid-url>'
+    if not parsed.scheme or not parsed.hostname:
+        return '<invalid-url>'
+    host = parsed.hostname
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, '', ''))
+
+
+SENSITIVE_DIAGNOSTIC_KEYS = {
+    'access_code',
+    'authorization',
+    'email',
+    'password',
+    'printer_sn',
+    'serial',
+    'sn',
+    'token'
+}
+
+
+def redact_diagnostic_data(value, key: str | None = None):
+    normalized_key = str(key or '').strip().lower()
+    if normalized_key in SENSITIVE_DIAGNOSTIC_KEYS or any(
+        marker in normalized_key for marker in ('password', 'secret', 'token', 'authorization')
+    ):
+        return '<redacted>'
+    if isinstance(value, dict):
+        return {
+            child_key: redact_diagnostic_data(child_value, child_key)
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_diagnostic_data(item) for item in value]
+    return value
+
+
+def detect_image_mime(image_bytes: bytes) -> str | None:
+    if image_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if image_bytes.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if len(image_bytes) >= 12 and image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
+        return 'image/webp'
+    return None
+
+
+def start_background_task(task_name: str, target, *args, **kwargs) -> bool:
+    """Start at most one bounded background operation for a task category."""
+    with background_tasks_lock:
+        existing = background_tasks.get(task_name)
+        if existing is not None and existing.is_alive():
+            return False
+
+        def runner():
+            try:
+                target(*args, **kwargs)
+            except Exception as exc:
+                update_writer_status(
+                    last_error=f"Background task {task_name} failed: {exc}",
+                    last_error_at=datetime.utcnow().isoformat() + 'Z'
+                )
+                print(f"Background task {task_name} failed: {exc}")
+            finally:
+                with background_tasks_lock:
+                    if background_tasks.get(task_name) is threading.current_thread():
+                        background_tasks.pop(task_name, None)
+
+        worker = threading.Thread(target=runner, name=f"bambu2obs-{task_name}", daemon=True)
+        background_tasks[task_name] = worker
+        worker.start()
+        return True
+
+
+def join_background_tasks(timeout: float = 2.0):
+    with background_tasks_lock:
+        workers = list(background_tasks.values())
+    deadline = time.monotonic() + timeout
+    for worker in workers:
+        remaining = max(0.0, deadline - time.monotonic())
+        worker.join(remaining)
+
 def update_writer_status(**fields):
     """Persist lightweight runtime diagnostics for writer-side troubleshooting."""
     with writer_status_lock:
         writer_status.update(fields)
         writer_status["updated_at"] = datetime.utcnow().isoformat() + "Z"
         try:
-            with open(WRITER_STATUS_FILE_PATH, 'w', encoding='utf-8') as status_file:
-                json.dump(writer_status, status_file, ensure_ascii=False, indent=2)
+            atomic_write_json(WRITER_STATUS_FILE_PATH, writer_status)
         except OSError as exc:
             print(f"Failed to persist writer status: {exc}")
+
+
+def create_printer_tls_context() -> ssl.SSLContext:
+    """Create the TLS policy shared by MQTT and implicit FTPS."""
+    if PRINTER_TLS_FINGERPRINT_SHA256 or ALLOW_INSECURE_PRINTER_TLS:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+    return ssl.create_default_context()
+
+
+def verify_tls_peer_fingerprint(tls_socket, service_name: str):
+    """Verify a connected TLS peer when certificate pinning is configured."""
+    if not PRINTER_TLS_FINGERPRINT_SHA256:
+        return
+    certificate = tls_socket.getpeercert(binary_form=True)
+    if not certificate:
+        raise ssl.SSLError(f"{service_name} did not provide a peer certificate")
+    actual_fingerprint = hashlib.sha256(certificate).hexdigest()
+    if actual_fingerprint != PRINTER_TLS_FINGERPRINT_SHA256:
+        raise ssl.SSLError(
+            f"{service_name} certificate fingerprint does not match PRINTER_TLS_FINGERPRINT_SHA256"
+        )
+
+
+def verify_printer_certificate(host: str, port: int, service_name: str):
+    """Preflight a pinned printer certificate before an MQTT connection or reconnect."""
+    if not PRINTER_TLS_FINGERPRINT_SHA256:
+        return
+    context = create_printer_tls_context()
+    with socket.create_connection((host, port), timeout=10) as raw_socket:
+        with context.wrap_socket(raw_socket, server_hostname=host) as tls_socket:
+            verify_tls_peer_fingerprint(tls_socket, service_name)
 
 class ImplicitReusedFTP_TLS(ftplib.FTP_TLS):
     """Implicit FTPS client with TLS session reuse for printer compatibility."""
@@ -243,15 +442,45 @@ def _select_best_archive(entries: list[dict], normalized_candidates: list[str]):
 
 def _download_ftp_file_bytes(ftp_client, remote_name: str) -> bytes:
     buffer = io.BytesIO()
-    ftp_client.retrbinary(f"RETR {remote_name}", buffer.write)
+
+    def write_chunk(chunk: bytes):
+        if buffer.tell() + len(chunk) > MAX_3MF_ARCHIVE_BYTES:
+            raise ValueError(
+                f"Printer archive exceeds MAX_3MF_ARCHIVE_BYTES ({MAX_3MF_ARCHIVE_BYTES} bytes)"
+            )
+        buffer.write(chunk)
+
+    ftp_client.retrbinary(f"RETR {remote_name}", write_chunk)
     return buffer.getvalue()
 
 def _extract_preview_bytes_from_3mf(archive_bytes: bytes):
+    if len(archive_bytes) > MAX_3MF_ARCHIVE_BYTES:
+        raise ValueError(
+            f"Printer archive exceeds MAX_3MF_ARCHIVE_BYTES ({MAX_3MF_ARCHIVE_BYTES} bytes)"
+        )
     with zipfile.ZipFile(io.BytesIO(archive_bytes), 'r') as archive:
-        members = archive.namelist()
+        member_infos = archive.infolist()
+        if len(member_infos) > MAX_3MF_MEMBER_COUNT:
+            raise ValueError(
+                f"Printer archive contains more than {MAX_3MF_MEMBER_COUNT} members"
+            )
+        members = [member.filename for member in member_infos]
+        info_by_name = {member.filename: member for member in member_infos}
+
+        def read_bounded_image(member_name: str):
+            member_info = info_by_name[member_name]
+            if member_info.file_size > MAX_PREVIEW_IMAGE_BYTES:
+                raise ValueError(
+                    f"Preview image exceeds MAX_PREVIEW_IMAGE_BYTES ({MAX_PREVIEW_IMAGE_BYTES} bytes)"
+                )
+            image_bytes = archive.read(member_info)
+            if not detect_image_mime(image_bytes):
+                raise ValueError(f"Unsupported or malformed preview image: {member_name}")
+            return image_bytes
+
         for preferred in SD_PREVIEW_PRIORITY_MEMBERS:
             if preferred in members:
-                return archive.read(preferred), preferred
+                return read_bounded_image(preferred), preferred
         image_members = [
             member for member in members
             if member.lower().startswith('metadata/') and member.lower().endswith(('.png', '.jpg', '.jpeg'))
@@ -259,7 +488,7 @@ def _extract_preview_bytes_from_3mf(archive_bytes: bytes):
         if image_members:
             image_members.sort(key=lambda member: (0 if 'plate_1' in member.lower() else 1, len(member)))
             selected = image_members[0]
-            return archive.read(selected), selected
+            return read_bounded_image(selected), selected
     return None, None
 
 def clear_print_cover_files():
@@ -278,12 +507,19 @@ def clear_print_cover_files():
 def save_print_cover_image(image_bytes: bytes, source_label: str):
     if not image_bytes:
         return False
+    if len(image_bytes) > MAX_PREVIEW_IMAGE_BYTES:
+        update_writer_status(last_error="Rejected oversized print cover image")
+        return False
+    image_mime = detect_image_mime(image_bytes)
+    if not image_mime:
+        update_writer_status(last_error="Rejected unsupported or malformed print cover image")
+        return False
     try:
-        with open(PRINT_COVER_IMAGE_PATH, 'wb') as cover_file:
-            cover_file.write(image_bytes)
+        atomic_write_bytes(PRINT_COVER_IMAGE_PATH, image_bytes)
         update_writer_status(
             preview_source=source_label,
             preview_image_size=len(image_bytes),
+            preview_image_mime=image_mime,
             preview_image_updated_at=datetime.utcnow().isoformat() + "Z"
         )
         return True
@@ -306,6 +542,13 @@ def _build_preview_job_key(task_data=None, print_data=None):
         key_parts.append("unknown_job")
     return '|'.join(key_parts)
 
+
+def is_active_local_print(print_data=None) -> bool:
+    data = print_data or {}
+    print_type = str(data.get('print_type', '')).lower()
+    gcode_state = str(data.get('gcode_state', '')).upper()
+    return print_type in {'local', 'lan'} and gcode_state not in {'', 'IDLE', 'FAILED', 'FINISH'}
+
 def _should_attempt_sd_preview(job_key: str, force: bool):
     now = time.time()
     with sd_preview_lock:
@@ -316,6 +559,8 @@ def _should_attempt_sd_preview(job_key: str, force: bool):
             sd_preview_attempt_state['attempted_at'] = now
             sd_preview_attempt_state['success'] = False
             return True
+        if sd_preview_attempt_state.get('success'):
+            return False
         if now - last_attempt >= SD_PREVIEW_RETRY_SECONDS:
             sd_preview_attempt_state['attempted_at'] = now
             return True
@@ -351,8 +596,9 @@ def attempt_sdcard_preview_fallback(task_data=None, print_data=None, force=False
     ftp_client = None
 
     try:
-        ftp_client = ImplicitReusedFTP_TLS()
+        ftp_client = ImplicitReusedFTP_TLS(context=create_printer_tls_context())
         ftp_client.connect(PRINTER_IP, 990, timeout=10)
+        verify_tls_peer_fingerprint(ftp_client.sock, 'Printer FTPS')
         ftp_client.login(user='bblp', passwd=ACCESS_CODE)
         ftp_client.prot_p()
 
@@ -399,30 +645,60 @@ def attempt_sdcard_preview_fallback(task_data=None, print_data=None, force=False
             except Exception:
                 pass
 
+
+def request_sdcard_preview_fallback(task_data=None, print_data=None, force=False) -> bool:
+    """Run FTPS and archive work away from the MQTT callback thread."""
+    task_snapshot = dict(task_data or {})
+    print_snapshot = dict(print_data or {})
+    return start_background_task(
+        'sd-preview',
+        attempt_sdcard_preview_fallback,
+        task_data=task_snapshot,
+        print_data=print_snapshot,
+        force=force
+    )
+
 def launch_progress_server():
     """Launches the progress bar server as a separate process."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     server_path = os.path.join(script_dir, 'progressbarServer.py')
     env = os.environ.copy()
     env["BASE_DIR"] = BASE_DIR
+    env["PROGRESS_SERVER_PORT"] = str(PROGRESS_SERVER_PORT)
     proc = subprocess.Popen([sys.executable, server_path], env=env)
     subprocesses.append(proc)
-    return proc
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            subprocesses.remove(proc)
+            raise RuntimeError(f"Progress server exited during startup with code {proc.returncode}")
+        try:
+            with socket.create_connection(('127.0.0.1', PROGRESS_SERVER_PORT), timeout=0.25):
+                return proc
+        except OSError:
+            time.sleep(0.1)
+    cleanup_subprocesses()
+    raise TimeoutError(
+        f"Progress server did not become ready on 127.0.0.1:{PROGRESS_SERVER_PORT}"
+    )
 
 def cleanup_subprocesses():
     """Terminates all running subprocesses initiated by this script."""
-    for proc in subprocesses:
-        proc.terminate()  # Terminate the subprocess
-        proc.wait()       # Wait for the subprocess to exit
+    while subprocesses:
+        proc = subprocesses.pop()
+        if proc.poll() is not None:
+            continue
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        except OSError as exc:
+            print(f"Failed to stop progress bar server process: {exc}")
 
 def stop_progressbar_server(proc=None):
     """Terminate the provided progress bar process and any tracked subprocesses."""
-    if proc is not None:
-        try:
-            proc.terminate()
-            proc.wait()
-        except Exception as exc:
-            print(f"Failed to stop progress bar server process: {exc}")
     cleanup_subprocesses()
 
 total_layer_num_global = None
@@ -686,7 +962,7 @@ if not os.path.exists(BASE_DIR):
     os.makedirs(BASE_DIR, exist_ok=True)
 
 update_writer_status(state="initialized")
-        
+
 def format_remaining_time(minutes):
     """Formats remaining time from minutes to '-HhMm'."""
     hours, minutes = divmod(minutes, 60)
@@ -704,8 +980,7 @@ def write_to_file(filename, content):
         else:
             serialized_content = str(content)
 
-        with open(path, 'w', encoding='utf-8') as file:
-            file.write(serialized_content)
+        atomic_write_text(path, serialized_content)
 
         new_write_count = int(writer_status.get("write_count", 0)) + 1
         update_writer_status(
@@ -744,8 +1019,7 @@ def persist_latest_task_id(task_id: str, task_id_path: str = TASK_ID_FILE_PATH):
     """Persist the provided task ID so that restarts can resume seamlessly."""
     if not task_id:
         return
-    with open(task_id_path, 'w', encoding='utf-8') as file:
-        file.write(str(task_id))
+    atomic_write_text(task_id_path, str(task_id))
 
 def reset_layer_tracking():
     """Clear cached layer tracking information when a new job starts."""
@@ -776,10 +1050,11 @@ def _parse_concatenated_json(content: str, max_entries: int):
 def persist_connection_dumps():
     """Write the current connection dumps deque to disk."""
     try:
-        with open(DUMPS_FILE_PATH, 'w', encoding='utf-8') as dumps_file:
-            for entry in connection_dumps:
-                json.dump(entry, dumps_file, ensure_ascii=False)
-                dumps_file.write('\n')
+        serialized = ''.join(
+            json.dumps(entry, ensure_ascii=False) + '\n'
+            for entry in connection_dumps
+        )
+        atomic_write_text(DUMPS_FILE_PATH, serialized)
     except OSError as exc:
         print(f"Failed to persist connection dumps: {exc}")
 
@@ -801,7 +1076,7 @@ def initialize_connection_dumps():
 
 def append_connection_dump(entry: dict):
     """Append a new dump entry while ensuring the total count stays within the configured limit."""
-    connection_dumps.append(entry)
+    connection_dumps.append(redact_diagnostic_data(entry))
     persist_connection_dumps()
 
 # Initialize debug dump buffer after helpers are defined
@@ -841,46 +1116,46 @@ def read_filament_color_from_file(tray_idx):
 
 # Helper function to read active ams tray from file
 def read_active_ams_tray_from_file():
-    amstray_file_path = os.path.join(BASE_DIR, f'activeAmsTray.txt')
+    amstray_file_path = os.path.join(BASE_DIR, 'activeAmsTray.txt')
     try:
         with open(amstray_file_path, 'r') as file:
             return file.read().strip()
     except FileNotFoundError:
         print(f"File {amstray_file_path} not found.")
         return None
-    
+
 # Function to update the SVG with colors for all trays
 def update_svg_with_all_tray_colors():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     input_svg_path = os.path.join(script_dir, "templates", "Filaments.svg")
     active_input_svg_path = os.path.join(script_dir, "templates", "ActiveFilament.svg")
-    output_svg_path = os.path.join(script_dir, os.pardir, "data", "Filaments.svg")
-    active_output_svg_path = os.path.join(script_dir, os.pardir, "data", "ActiveFilament.svg")
-    
+    output_svg_path = os.path.join(BASE_DIR, "Filaments.svg")
+    active_output_svg_path = os.path.join(BASE_DIR, "ActiveFilament.svg")
+
     tree = ET.parse(input_svg_path)
     active_tree = ET.parse(active_input_svg_path)
     root = tree.getroot()
     active_root = active_tree.getroot()
     namespaces = {'svg': 'http://www.w3.org/2000/svg'}
     ET.register_namespace('', 'http://www.w3.org/2000/svg')
-    
+
     # Correctly read the active tray value from file
     try:
         active_ams_tray = int(read_active_ams_tray_from_file())
     except (TypeError, ValueError):
         active_ams_tray = None
-    
+
     for tray_idx in range(1, 5):
         filament_color = read_filament_color_from_file(tray_idx)
         rgb_color = hex_to_rgb_percent(filament_color) if filament_color and filament_color != 'N/A' else None
-        
+
         if rgb_color:
             # Update Filaments.svg
             element_id = f'Color{tray_idx}'
             element = root.find(f".//*[@id='{element_id}']", namespaces)
             if element is not None:
                 element.set('fill', rgb_color)
-            
+
             # Update ActiveFilament.svg for lines
             for line_part in ['a', 'b', 'c']:
                 line_id = f'Line{tray_idx}{line_part}'
@@ -916,11 +1191,15 @@ def update_svg_with_all_tray_colors():
 
 
     # Save the modified SVGs
-    tree.write(output_svg_path, xml_declaration=True, encoding='utf-8')
-    active_tree.write(active_output_svg_path, xml_declaration=True, encoding='utf-8')
+    output_buffer = io.BytesIO()
+    active_output_buffer = io.BytesIO()
+    tree.write(output_buffer, xml_declaration=True, encoding='utf-8')
+    active_tree.write(active_output_buffer, xml_declaration=True, encoding='utf-8')
+    atomic_write_bytes(output_svg_path, output_buffer.getvalue())
+    atomic_write_bytes(active_output_svg_path, active_output_buffer.getvalue())
     print(f"Modified SVG saved as {output_svg_path}")
     print(f"Modified ActiveFilament SVG saved as {active_output_svg_path}")
-    
+
 # Load the persisted total_layer_num at script startup
 total_layer_num_global = load_from_file("total_layer_num", None)
 previous_task_id = load_last_processed_task_id()
@@ -933,13 +1212,35 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
         mqtt_reason_code=str(reason_code),
         mqtt_topic=f"device/{PRINTER_SN}/report"
     )
-    client.subscribe(f"device/{PRINTER_SN}/report")
+    if reason_code == 0:
+        client.subscribe(f"device/{PRINTER_SN}/report")
+
+
+def on_disconnect(client, userdata, disconnect_flags=None, reason_code=None, properties=None):
+    update_writer_status(
+        state="mqtt_disconnected",
+        mqtt_disconnected_at=datetime.utcnow().isoformat() + "Z",
+        mqtt_reason_code=str(reason_code)
+    )
+
+
+def refresh_cloud_metadata_for_new_task():
+    try:
+        bambu_cloud = BambuCloud(REGION, EMAIL, PASSWORD, auth_token=CLOUD_AUTH_TOKEN)
+        bambu_cloud.login()
+        process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR, force_update=True)
+    except Exception as auth_error:
+        update_writer_status(
+            last_error=f"Failed cloud refresh after new task: {auth_error}",
+            last_error_at=datetime.utcnow().isoformat() + "Z"
+        )
+        print(f"Failed to refresh latest task from cloud: {auth_error}")
 
 def on_message(client, userdata, msg):
     global total_layer_num_global, previous_task_id, latest_print_data
-    print(" ")
-    print(f"Message received -> Topic: {msg.topic} Message: {msg.payload.decode('utf-8')}")
     try:
+        decoded_payload = msg.payload.decode('utf-8')
+        print(f"Message received -> Topic: {msg.topic}; bytes={len(msg.payload)}")
         message_count = int(writer_status.get("mqtt_message_count", 0)) + 1
         update_writer_status(
             state="mqtt_message_received",
@@ -947,7 +1248,7 @@ def on_message(client, userdata, msg):
             last_mqtt_message_at=datetime.utcnow().isoformat() + "Z",
             last_mqtt_topic=msg.topic
         )
-        message_data = json.loads(msg.payload.decode('utf-8'))
+        message_data = json.loads(decoded_payload)
 
         # Convert numeric values to strings where necessary
         message_data_str = convert_all_to_str(message_data)
@@ -968,17 +1269,7 @@ def on_message(client, userdata, msg):
                 write_to_file('printCover', 'N/A')
                 previous_task_id = current_task_id  # Update the last known task ID
                 persist_latest_task_id(current_task_id)
-                # Reconnect to Bambu Cloud to fetch the latest task information
-                try:
-                    bambu_cloud = BambuCloud(REGION, EMAIL, PASSWORD, auth_token=CLOUD_AUTH_TOKEN)
-                    bambu_cloud.login()
-                    process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR, force_update=True)
-                except Exception as auth_error:
-                    update_writer_status(
-                        last_error=f"Failed cloud refresh after new task: {auth_error}",
-                        last_error_at=datetime.utcnow().isoformat() + "Z"
-                    )
-                    print(f"Failed to refresh latest task from cloud: {auth_error}")
+                start_background_task('cloud-refresh', refresh_cloud_metadata_for_new_task)
     except Exception as e:
         update_writer_status(
             last_error=f"Error processing MQTT message: {e}",
@@ -1042,11 +1333,18 @@ def handle_print_data(print_data):
         print(f"Received mc_print_stage: {print_data['mc_print_stage']}")
         print(f"CURRENT_STAGE_IDS keys: {list(CURRENT_STAGE_IDS.keys())}")
 
-        mc_print_stage_key = str(print_data['mc_print_stage'])
-        mc_print_stage_name = CURRENT_STAGE_IDS.get(mc_print_stage_key, "Unknown Print Stage")
+        raw_stage = print_data['mc_print_stage']
+        try:
+            mc_print_stage_key = int(raw_stage)
+        except (TypeError, ValueError):
+            mc_print_stage_key = str(raw_stage)
+        mc_print_stage_name = CURRENT_STAGE_IDS.get(
+            mc_print_stage_key,
+            CURRENT_STAGE_IDS.get(str(mc_print_stage_key), "Unknown Print Stage")
+        )
         print(f"Matched print stage name: {mc_print_stage_name}")  # Debug print
         write_to_file('printStage', mc_print_stage_name)
-        
+
     # Process layer number
     if "layer_num" in print_data:
         current_layer = str(print_data['layer_num'])
@@ -1070,46 +1368,62 @@ def handle_print_data(print_data):
         write_to_file('nozzleTemperature', f"{float(print_data['nozzle_temper']):.2f}")
 
     # Process AMS trays
-    if 'ams' in print_data and 'ams' in print_data['ams']:
+    if 'ams' in print_data and isinstance(print_data['ams'], dict) and 'ams' in print_data['ams']:
         ams_entries = print_data['ams']['ams']
-        if ams_entries and 'tray' in ams_entries[0]:
-            for tray in ams_entries[0]['tray']:
-                tray_idx = int(tray['id']) + 1  # Adjusting from 0-based to 1-based indexing
+        processed_trays = 0
+        for ams_position, ams_unit in enumerate(ams_entries or []):
+            if not isinstance(ams_unit, dict):
+                continue
+            try:
+                ams_unit_number = int(ams_unit.get('id', ams_position)) + 1
+            except (TypeError, ValueError):
+                ams_unit_number = ams_position + 1
+            for tray_position, tray in enumerate(ams_unit.get('tray') or []):
+                if not isinstance(tray, dict):
+                    continue
+                try:
+                    tray_idx = int(tray.get('id', tray_position)) + 1
+                except (TypeError, ValueError):
+                    tray_idx = tray_position + 1
                 filament_id = tray.get('tray_info_idx', 'Unknown')
                 filament_color = tray.get('tray_color', 'N/A')
                 filament_name = FILAMENT_NAMES.get(filament_id, "Unknown Filament")
-                write_to_file(f'ams{tray_idx}FilamentId', filament_id)
-                write_to_file(f'ams{tray_idx}FilamentColor', filament_color)
-                write_to_file(f'ams{tray_idx}FilamentName', filament_name)
-        else:
+                canonical_prefix = f'ams{ams_unit_number}Tray{tray_idx}'
+                write_to_file(f'{canonical_prefix}FilamentId', filament_id)
+                write_to_file(f'{canonical_prefix}FilamentColor', filament_color)
+                write_to_file(f'{canonical_prefix}FilamentName', filament_name)
+                if ams_unit_number == 1:
+                    # Preserve filenames used by existing overlays.
+                    write_to_file(f'ams{tray_idx}FilamentId', filament_id)
+                    write_to_file(f'ams{tray_idx}FilamentColor', filament_color)
+                    write_to_file(f'ams{tray_idx}FilamentName', filament_name)
+                processed_trays += 1
+        if not processed_trays:
             print("AMS data present but no tray info available; skipping tray processing.")
 
     # Process active AMS tray
     if 'ams' in print_data and 'tray_now' in print_data['ams']:
         try:
-            active_tray_zero_based = int(print_data['ams']['tray_now'])
-            if 0 <= active_tray_zero_based <= 3:
-                active_tray = active_tray_zero_based + 1  # Adjusting from 0-based to 1-based indexing
-                write_to_file('activeAmsTray', str(active_tray))
+            active_global_tray = int(print_data['ams']['tray_now'])
+            if 0 <= active_global_tray <= 15:
+                active_ams_unit = (active_global_tray // 4) + 1
+                active_tray = (active_global_tray % 4) + 1
+                write_to_file('activeAmsUnit', str(active_ams_unit))
+                write_to_file('activeAmsTrayInUnit', str(active_tray))
+                write_to_file('activeAmsTray', str(active_tray) if active_ams_unit == 1 else 'N/A')
                 update_svg_with_all_tray_colors()
             else:
-                print(f"Ignoring invalid active AMS tray value: {active_tray_zero_based}")
+                print(f"Ignoring invalid active AMS tray value: {active_global_tray}")
         except (TypeError, ValueError):
             print(f"Could not parse active AMS tray value: {print_data['ams']['tray_now']}")
 
-    print_type = str(print_data.get('print_type', '')).lower()
-    gcode_state = str(print_data.get('gcode_state', '')).upper()
-    should_attempt_sd_preview = (
-        print_type in ('local', 'lan')
-        and gcode_state not in ('IDLE', 'FAILED', 'FINISH')
-    )
-    if should_attempt_sd_preview:
+    if is_active_local_print(print_data):
         current_job_key = _build_preview_job_key(print_data=print_data)
         previous_job_key = _get_last_sd_preview_job_key()
         if previous_job_key and current_job_key != previous_job_key:
             clear_print_cover_files()
             write_to_file('printCover', 'N/A')
-        attempt_sdcard_preview_fallback(print_data=print_data, force=False)
+        request_sdcard_preview_fallback(print_data=print_data, force=False)
 
 def format_time_hms(seconds):
     """Formats time from seconds to 'HhMmSs'."""
@@ -1140,6 +1454,48 @@ def extract_task_preview_urls(task_data):
 
     return urls
 
+
+def validate_remote_preview_url(preview_url: str):
+    """Accept only HTTPS remote URLs and reject obvious local-network targets."""
+    try:
+        parsed = urlsplit(preview_url)
+    except ValueError as exc:
+        raise ValueError("Preview URL is malformed") from exc
+    if parsed.scheme.lower() != 'https' or not parsed.hostname:
+        raise ValueError("Preview URL must use HTTPS and include a hostname")
+    if parsed.username or parsed.password:
+        raise ValueError("Preview URL must not contain embedded credentials")
+    hostname = parsed.hostname.lower().rstrip('.')
+    if hostname == 'localhost' or hostname.endswith('.localhost'):
+        raise ValueError("Preview URL must not target localhost")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise ValueError("Preview URL must not target a private or local IP address")
+    return parsed
+
+
+def read_limited_response(response, maximum_bytes: int) -> bytes:
+    content_length = response.headers.get('Content-Length')
+    if content_length:
+        try:
+            if int(content_length) > maximum_bytes:
+                raise ValueError(f"Response exceeds the {maximum_bytes}-byte limit")
+        except ValueError as exc:
+            if 'exceeds' in str(exc):
+                raise
+
+    buffer = io.BytesIO()
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        if buffer.tell() + len(chunk) > maximum_bytes:
+            raise ValueError(f"Response exceeds the {maximum_bytes}-byte limit")
+        buffer.write(chunk)
+    return buffer.getvalue()
+
 def download_cloud_preview_image(bambu_cloud, preview_url: str):
     """Download preview bytes using the cloud client session."""
     if not bambu_cloud or not preview_url:
@@ -1148,34 +1504,55 @@ def download_cloud_preview_image(bambu_cloud, preview_url: str):
     if bambu_cloud.session is None:
         bambu_cloud.login()
 
-    request_attempts = []
-    if bambu_cloud.auth_token:
-        request_attempts.append((
-            "authorized",
-            {'Authorization': f"Bearer {bambu_cloud.auth_token}"}
-        ))
-    request_attempts.append(("plain", None))
+    try:
+        parsed = validate_remote_preview_url(preview_url)
+    except ValueError as exc:
+        print(f"Rejected preview URL {redact_url(preview_url)}: {exc}")
+        return None, None
 
-    for mode, headers in request_attempts:
-        try:
-            request_kwargs = {'timeout': 10}
-            if headers:
-                request_kwargs['headers'] = headers
-            response = bambu_cloud.session.get(preview_url, **request_kwargs)
-            if response.ok and response.content:
-                return response.content, mode
-            print(f"Preview download attempt '{mode}' returned HTTP {response.status_code} for {preview_url}")
-        except Exception as exc:
-            print(f"Preview download attempt '{mode}' failed for {preview_url}: {exc}")
+    api_host = urlsplit(cloud_api_base_url(bambu_cloud.region)).hostname
+    is_bambu_api_host = parsed.hostname.lower().rstrip('.') == str(api_host or '').lower().rstrip('.')
+    headers = None
+    mode = 'plain'
+    requester = requests
+    if is_bambu_api_host and bambu_cloud.auth_token:
+        headers = {'Authorization': f"Bearer {bambu_cloud.auth_token}"}
+        mode = 'authorized'
+        requester = bambu_cloud.session
 
-    return None, None
+    response = None
+    try:
+        response = requester.get(
+            preview_url,
+            headers=headers,
+            timeout=(5, 10),
+            stream=True
+        )
+        if not response.ok:
+            print(
+                f"Preview download attempt '{mode}' returned HTTP {response.status_code} "
+                f"for {redact_url(preview_url)}"
+            )
+            return None, None
+        image_bytes = read_limited_response(response, MAX_PREVIEW_IMAGE_BYTES)
+        if not detect_image_mime(image_bytes):
+            print(f"Preview response was not a supported image: {redact_url(preview_url)}")
+            return None, None
+        return image_bytes, mode
+    except Exception as exc:
+        print(f"Preview download attempt '{mode}' failed for {redact_url(preview_url)}: {exc}")
+        return None, None
+    finally:
+        if response is not None:
+            response.close()
 
 
 def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
     global is_first_run, previous_task_id, latest_print_data
     if bambu_cloud is None:
         print("Cloud client not available; skipping latest task processing.")
-        attempt_sdcard_preview_fallback(print_data=latest_print_data, force=force_update)
+        if is_active_local_print(latest_print_data):
+            request_sdcard_preview_fallback(print_data=latest_print_data, force=force_update)
         return
     if not printer_sn:
         print("Printer serial number not configured; skipping latest task processing.")
@@ -1191,7 +1568,8 @@ def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
 
     if not latest_task:
         print("No tasks found for this printer. Skipping task processing.")
-        attempt_sdcard_preview_fallback(print_data=latest_print_data, force=force_update)
+        if is_active_local_print(latest_print_data):
+            request_sdcard_preview_fallback(print_data=latest_print_data, force=force_update)
         return
 
     # Read the last processed task ID if exists
@@ -1234,7 +1612,11 @@ def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
 
         if not cover_downloaded:
             print("Attempting SD-card preview fallback.")
-            attempt_sdcard_preview_fallback(task_data=latest_task, print_data=latest_print_data, force=force_update)
+            request_sdcard_preview_fallback(
+                task_data=latest_task,
+                print_data=latest_print_data,
+                force=force_update
+            )
 
         # Update the last processed task ID
         persist_latest_task_id(current_task_id, task_id_path)
@@ -1250,6 +1632,22 @@ def process_latest_task(bambu_cloud, printer_sn, base_dir, force_update=False):
 
 
 def setup_mqtt_listener():
+    if not PRINTER_IP:
+        raise ValueError("PRINTER_IP must be configured")
+    if not PRINTER_SN:
+        raise ValueError("PRINTER_SN must be configured")
+    if not ACCESS_CODE:
+        raise ValueError("ACCESS_CODE must be configured")
+
+    def on_pre_connect(client, userdata):
+        verify_printer_certificate(PRINTER_IP, 8883, 'Printer MQTT')
+
+    def on_connect_fail(client, userdata):
+        update_writer_status(
+            state='mqtt_connect_failed',
+            mqtt_connect_failed_at=datetime.utcnow().isoformat() + 'Z'
+        )
+
     try:
         update_writer_status(
             state="mqtt_connecting",
@@ -1260,11 +1658,28 @@ def setup_mqtt_listener():
     except AttributeError:
         # Fallback for older paho-mqtt versions
         client = mqtt.Client()
-    client.tls_set(tls_version=ssl.PROTOCOL_TLS, cert_reqs=ssl.CERT_NONE)
-    client.tls_insecure_set(True)
+    tls_context = create_printer_tls_context()
+    client.tls_set_context(tls_context)
+    client.tls_insecure_set(bool(PRINTER_TLS_FINGERPRINT_SHA256 or ALLOW_INSECURE_PRINTER_TLS))
+    if hasattr(client, 'on_pre_connect'):
+        client.on_pre_connect = on_pre_connect
+    if hasattr(client, 'on_connect_fail'):
+        client.on_connect_fail = on_connect_fail
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
+    client.reconnect_delay_set(min_delay=1, max_delay=120)
     client.username_pw_set(username="bblp", password=ACCESS_CODE)
+    if ALLOW_INSECURE_PRINTER_TLS and not PRINTER_TLS_FINGERPRINT_SHA256:
+        print(
+            "WARNING: ALLOW_INSECURE_PRINTER_TLS is enabled. "
+            "Printer identity will not be verified. Prefer PRINTER_TLS_FINGERPRINT_SHA256."
+        )
+        update_writer_status(tls_trust_mode='explicit_insecure_exception')
+    elif PRINTER_TLS_FINGERPRINT_SHA256:
+        update_writer_status(tls_trust_mode='sha256_fingerprint')
+    else:
+        update_writer_status(tls_trust_mode='system_ca')
     client.connect(PRINTER_IP, 8883, 60)
     return client
 
@@ -1288,21 +1703,19 @@ def main():
             last_error_at=datetime.utcnow().isoformat() + "Z"
         )
         print(f"Unable to initialize Bambu Cloud connection: {e}")
-    
-    # Process the latest task from Bambu Cloud, forcing update on the first run (if available)
-    process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR, force_update=is_first_run)
 
-    server_proc = launch_progress_server()
-    update_writer_status(
-        state="progress_server_started",
-        progress_server_pid=getattr(server_proc, "pid", None)
-    )
-    print("Progress bar server started.")
-
+    server_proc = None
     try:
-        # Process the latest task from Bambu Cloud, if any
-        process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR)
+        # Process once before MQTT starts so the overlay has initial metadata.
+        process_latest_task(bambu_cloud, PRINTER_SN, BASE_DIR, force_update=is_first_run)
         print("Latest task processed.")
+
+        server_proc = launch_progress_server()
+        update_writer_status(
+            state="progress_server_started",
+            progress_server_pid=getattr(server_proc, "pid", None)
+        )
+        print("Progress bar server started.")
 
         # Setup and start MQTT listener for real-time printer status updates
         print("Connecting to the printer's local MQTT service...")
@@ -1320,10 +1733,11 @@ def main():
         )
         print(f"Unhandled exception: {e}")
     finally:
-        stop_progressbar_server(server_proc)
+        if server_proc is not None:
+            stop_progressbar_server(server_proc)
+        join_background_tasks()
         update_writer_status(state="stopped")
         print("Progress bar server stopped.")
 
 if __name__ == "__main__":
     main()
-    

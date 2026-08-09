@@ -1,9 +1,6 @@
-pybambu
-bambu-lab-cloud-api
-requests
-packaging
-paho-mqtt
-python-dotenv
-python-dateutil
-flask
-flask-cors
+pybambu==1.0.1
+bambu-lab-cloud-api==1.0.5
+requests==2.32.5
+paho-mqtt==2.1.0
+python-dotenv==1.2.1
+Flask==3.1.2
