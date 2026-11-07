@@ -2,7 +2,7 @@
 
 All notable changes to Bambu2OBS will be documented here.
 
-## 0.3.1
+## 0.3.0
 
 ### Security
 
