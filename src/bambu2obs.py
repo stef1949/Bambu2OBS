@@ -278,13 +278,18 @@ def update_writer_status(**fields):
 
 
 def create_printer_tls_context() -> ssl.SSLContext:
-    """Create the TLS policy shared by MQTT and implicit FTPS."""
+    """Create the TLS policy shared by MQTT and implicit FTPS.
+
+    Printers speak TLS 1.2, so older protocol versions are always refused.
+    """
     if PRINTER_TLS_FINGERPRINT_SHA256 or ALLOW_INSECURE_PRINTER_TLS:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        return context
-    return ssl.create_default_context()
+    else:
+        context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
 
 
 def verify_tls_peer_fingerprint(tls_socket, service_name: str):
