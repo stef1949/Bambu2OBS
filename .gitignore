@@ -27,6 +27,10 @@ __pycache__/
 build/
 dist/
 native/build*/
+native/.deps/
+native/package-*/
+native/package-installer/
+release/
 *.egg-info/
 .coverage
 htmlcov/

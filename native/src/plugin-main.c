@@ -5,7 +5,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("bambu-printer-overlay", "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-    return "Native Bambu printer telemetry overlay source";
+    return "Native Bambu printer overlay preview source " BAMBU_OVERLAY_VERSION;
 }
 
 extern struct obs_source_info bambu_overlay_source_info;

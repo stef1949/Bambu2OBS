@@ -28,3 +28,9 @@ The legacy overlay server binds only to `127.0.0.1`. Global CORS is intentionall
 ## Download limits
 
 Cloud images and printer `.3mf` archives are bounded before decoding. Keep these limits finite and increase them only when a known legitimate job requires it.
+
+## Native preview installer
+
+Preview installers are currently unsigned. Verify the adjacent SHA-256 sidecar before execution and download artifacts only from a trusted build or release. The portable installer verifies every plugin payload file against `manifest.json`, refuses ProgramData installation without elevation, and refuses to modify plugin files while OBS is running.
+
+The native preview contains no credentials and does not yet connect to a printer. Do not infer live-printer security parity from the installable simulation build.

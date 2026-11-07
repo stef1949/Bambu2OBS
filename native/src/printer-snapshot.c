@@ -17,13 +17,19 @@ static double clamp_double(double value, double minimum, double maximum)
 static bool copy_if_changed(char *destination, size_t capacity, const char *value)
 {
     const char *source = value != NULL ? value : "";
-    if (strncmp(destination, source, capacity) == 0)
-        return false;
+    size_t source_length;
 
     if (capacity == 0)
         return false;
-    strncpy(destination, source, capacity - 1);
-    destination[capacity - 1] = '\0';
+
+    source_length = strlen(source);
+    if (source_length >= capacity)
+        source_length = capacity - 1;
+    if (strlen(destination) == source_length && memcmp(destination, source, source_length) == 0)
+        return false;
+
+    memcpy(destination, source, source_length);
+    destination[source_length] = '\0';
     return true;
 }
 

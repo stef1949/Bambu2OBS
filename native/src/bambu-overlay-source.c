@@ -6,6 +6,8 @@
 
 #define SOURCE_ID "bambu_printer_overlay"
 #define SETTING_PROFILE "profile_id"
+#define SETTING_PREVIEW_NOTICE "preview_notice"
+#define SETTING_PLUGIN_VERSION "plugin_version"
 #define SETTING_PRESET "layout_preset"
 #define SETTING_SIMULATION "simulation_mode"
 #define SETTING_PROGRESS "simulation_progress"
@@ -155,15 +157,28 @@ static void bambu_overlay_render(void *data, gs_effect_t *unused_effect)
 static obs_properties_t *bambu_overlay_properties(void *data)
 {
     obs_properties_t *properties = obs_properties_create();
+    obs_property_t *notice;
+    obs_property_t *profile;
     obs_property_t *preset;
+    obs_property_t *version;
 
     UNUSED_PARAMETER(data);
-    obs_properties_add_text(
+    notice = obs_properties_add_text(
+        properties,
+        SETTING_PREVIEW_NOTICE,
+        obs_module_text("BambuOverlay.PreviewNotice"),
+        OBS_TEXT_INFO
+    );
+    obs_property_text_set_info_type(notice, OBS_TEXT_INFO_WARNING);
+    obs_property_text_set_info_word_wrap(notice, true);
+
+    profile = obs_properties_add_text(
         properties,
         SETTING_PROFILE,
         obs_module_text("BambuOverlay.Profile"),
         OBS_TEXT_DEFAULT
     );
+    obs_property_set_enabled(profile, false);
     preset = obs_properties_add_list(
         properties,
         SETTING_PRESET,
@@ -191,6 +206,13 @@ static obs_properties_t *bambu_overlay_properties(void *data)
         obs_module_text("BambuOverlay.BackgroundColor")
     );
     obs_properties_add_color_alpha(properties, SETTING_ACCENT, obs_module_text("BambuOverlay.AccentColor"));
+    version = obs_properties_add_text(
+        properties,
+        SETTING_PLUGIN_VERSION,
+        obs_module_text("BambuOverlay.PluginVersion"),
+        OBS_TEXT_INFO
+    );
+    obs_property_set_long_description(version, BAMBU_OVERLAY_VERSION);
     return properties;
 }
 

@@ -1,0 +1,60 @@
+name: Native OBS package
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'native/**'
+      - 'LICENSE'
+      - 'THIRD_PARTY_NOTICES.md'
+      - '.github/workflows/native-package.yml'
+  pull_request:
+    paths:
+      - 'native/**'
+      - 'LICENSE'
+      - 'THIRD_PARTY_NOTICES.md'
+      - '.github/workflows/native-package.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Cache pinned OBS development dependencies
+        uses: actions/cache@v4
+        with:
+          path: native/.deps
+          key: obs-native-windows-x64-${{ hashFiles('native/buildspec.json') }}
+
+      - name: Configure native plugin
+        working-directory: native
+        run: cmake --preset windows-x64
+
+      - name: Build native plugin
+        working-directory: native
+        run: cmake --build --preset windows-x64
+
+      - name: Run libobs and native-core tests
+        working-directory: native
+        run: ctest --preset windows-x64
+
+      - name: Create and validate installer artifacts
+        shell: powershell
+        run: .\native\scripts\package-windows.ps1 -Configuration Release
+
+      - name: Upload unsigned preview package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bambu-Printer-Overlay-Windows-x64-preview
+          path: |
+            release/*.exe
+            release/*.zip
+            release/*.sha256
+          if-no-files-found: error
