@@ -2,6 +2,12 @@
 
 All notable changes to Bambu2OBS will be documented here.
 
+## Unreleased
+
+### Security
+
+- Updated the legacy Python tools' dependencies to fix the open Dependabot alerts: requests 2.34.2 (GHSA-gc5v-m9x4-r6x2), python-dotenv 1.2.4 (GHSA-mf9w-mj56-hr94), and Flask 3.1.3 (GHSA-68rp-wp8r-4726). The native plugin does not use them.
+
 ## 0.3.0
 
 ### Added
