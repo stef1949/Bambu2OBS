@@ -1,6 +1,7 @@
 import importlib
 import io
 import os
+import ssl
 import sys
 import tempfile
 import time
@@ -315,6 +316,21 @@ class SdPreviewFallbackTests(unittest.TestCase):
         self.assertEqual(redacted["token"], "<redacted>")
         self.assertEqual(redacted["device"]["access_code"], "<redacted>")
         self.assertEqual(redacted["device"]["state"], "RUNNING")
+
+    def test_printer_tls_context_refuses_tls_before_1_2(self):
+        cases = (
+            ("verified", "", False, ssl.CERT_REQUIRED),
+            ("pinned", "ab" * 32, False, ssl.CERT_NONE),
+            ("insecure", "", True, ssl.CERT_NONE),
+        )
+        for label, fingerprint, allow_insecure, verify_mode in cases:
+            with self.subTest(label), \
+                    patch.object(self.module, "PRINTER_TLS_FINGERPRINT_SHA256", fingerprint), \
+                    patch.object(self.module, "ALLOW_INSECURE_PRINTER_TLS", allow_insecure):
+                context = self.module.create_printer_tls_context()
+
+                self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+                self.assertEqual(context.verify_mode, verify_mode)
 
 
 if __name__ == "__main__":

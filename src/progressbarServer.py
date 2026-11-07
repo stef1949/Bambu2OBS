@@ -40,7 +40,7 @@ def resolve_base_dir():
     return str(repo_candidate)
 
 BASE_DIR = resolve_base_dir()
-SVG_FILES = ['Filaments.svg', 'ActiveFilament.svg']
+SVG_FILES = ('Filaments.svg', 'ActiveFilament.svg')
 JOB_NAME_FILES = ['designTitle.txt', 'printProfile.txt']
 COVER_IMAGE_NAME = 'printCover.png'
 COVER_IMAGE_CANDIDATES = (COVER_IMAGE_NAME, 'printcover.png')
@@ -74,6 +74,18 @@ TELEMETRY_FILES = {
     'print_stage': 'printStage.txt',
     'fan_speed': 'coolingFanSpeed.txt'
 }
+
+def known_svg_file(filename):
+    """Return the matching entry of SVG_FILES, or None.
+
+    The result is the server's own string, never the request's, so it is safe
+    to use in paths and pages.
+    """
+    for name in SVG_FILES:
+        if filename == name:
+            return name
+    return None
+
 
 def no_store(response):
     response = app.make_response(response)
@@ -211,8 +223,9 @@ def read_progress_details():
                 elif selected_progress is None:
                     selected_progress = value
                     selected_source_path = path
-        except OSError as exc:
-            detail['error'] = str(exc)
+        except OSError:
+            app.logger.warning('Could not read %s', path, exc_info=True)
+            detail['error'] = 'Could not read the file. See the server log for details.'
             continue
 
     return {
@@ -314,8 +327,9 @@ def get_progress():
             if source_name:
                 response.headers['X-Progress-Source'] = source_name
         return no_store(response)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        app.logger.exception('Failed to read progress')
+        return no_store((jsonify({'error': 'Failed to read progress. See the server log for details.'}), 500))
 
 @app.route('/diagnostics/progress')
 def diagnostics_progress():
@@ -349,8 +363,12 @@ def diagnostics_writer():
             payload['status_file_age_seconds'] = max(0.0, round(time.time() - stat.st_mtime, 3))
             with open(WRITER_STATUS_FILE_PATH, 'r', encoding='utf-8') as status_file:
                 payload['writer_status'] = json.load(status_file)
-        except (OSError, ValueError) as exc:
-            payload['error'] = str(exc)
+        except OSError:
+            app.logger.warning('Could not read %s', WRITER_STATUS_FILE_PATH, exc_info=True)
+            payload['error'] = 'writerStatus.json could not be read. See the server log for details.'
+        except ValueError:
+            app.logger.warning('Could not parse %s', WRITER_STATUS_FILE_PATH, exc_info=True)
+            payload['error'] = 'writerStatus.json is not valid JSON. See the server log for details.'
     else:
         payload['error'] = 'writerStatus.json not found. Start bambu2obs.py to populate writer diagnostics.'
 
@@ -778,8 +796,9 @@ def progressbar_view():
 
 @app.route('/updates/<filename>')
 def updates(filename):
-    if filename in SVG_FILES:
-        response = Response(file_watcher(filename), content_type='text/event-stream')
+    name = known_svg_file(filename)
+    if name:
+        response = Response(file_watcher(name), content_type='text/event-stream')
         response.headers['X-Accel-Buffering'] = 'no'
         return no_store(response)
     return no_store(("File not found", 404))
@@ -796,29 +815,35 @@ def serve_svg(filename):
 
 @app.route('/view/<filename>')
 def view_svg(filename):
-    if filename in SVG_FILES:
-        html = f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <title>SVG Viewer - {filename}</title>
-        </head>
-        <body>
-            <img src="/svg/{filename}" id="svgImage">
-            <script>
-                const evtSource = new EventSource("/updates/{filename}");
-                evtSource.onmessage = function(event) {{
-                    const img = document.getElementById('svgImage');
-                    const src = img.src.split('?')[0];
-                    img.src = `${{src}}?t=${{new Date().getTime()}}`;
-                }};
-            </script>
-        </body>
-        </html>
-        """
-        return no_store(render_template_string(html))
-    return no_store(("File not found", 404))
+    name = known_svg_file(filename)
+    if not name:
+        return no_store(("File not found", 404))
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>SVG Viewer - {{ name }}</title>
+    </head>
+    <body>
+        <img src="{{ svg_url }}" id="svgImage">
+        <script>
+            const evtSource = new EventSource({{ updates_url|tojson }});
+            evtSource.onmessage = function(event) {
+                const img = document.getElementById('svgImage');
+                const src = img.src.split('?')[0];
+                img.src = `${src}?t=${new Date().getTime()}`;
+            };
+        </script>
+    </body>
+    </html>
+    """
+    return no_store(render_template_string(
+        html,
+        name=name,
+        svg_url=url_for('serve_svg', filename=name),
+        updates_url=url_for('updates', filename=name)
+    ))
 
 if __name__ == '__main__':
     # Disable the Flask reloader to avoid recursive subprocess spawning when

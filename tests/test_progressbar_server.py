@@ -4,6 +4,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import quote
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -237,6 +239,75 @@ class ProgressbarServerTests(unittest.TestCase):
         self.assertTrue(payload["status_file_exists"])
         self.assertEqual(payload["writer_status"], status_payload)
         self.assertIn("status_file_age_seconds", payload)
+
+    def test_writer_diagnostics_hide_parse_error_details(self):
+        self._write("writerStatus.json", "{not json")
+
+        with self.assertLogs(self.module.app.logger, level="WARNING"):
+            response = self.client.get("/diagnostics/writer")
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(payload["writer_status"])
+        self.assertEqual(
+            payload["error"],
+            "writerStatus.json is not valid JSON. See the server log for details."
+        )
+
+    def test_progress_diagnostics_hide_read_error_details(self):
+        (Path(self.temp_dir.name) / "progress.txt").mkdir()
+
+        with self.assertLogs(self.module.app.logger, level="WARNING"):
+            response = self.client.get("/diagnostics/progress")
+        files_by_name = {entry["filename"]: entry for entry in response.get_json()["files"]}
+
+        self.assertEqual(
+            files_by_name["progress.txt"]["error"],
+            "Could not read the file. See the server log for details."
+        )
+
+    def test_progress_error_hides_exception_details(self):
+        failure = RuntimeError("secret detail")
+        with patch.object(self.module, "read_progress_details", side_effect=failure), \
+                self.assertLogs(self.module.app.logger, level="ERROR"):
+            response = self.client.get("/progress")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn(b"secret detail", response.data)
+        self.assertEqual(
+            response.get_json()["error"],
+            "Failed to read progress. See the server log for details."
+        )
+        self.assertIn("no-store", response.headers["Cache-Control"])
+
+    def test_svg_view_links_known_files(self):
+        for name in self.module.SVG_FILES:
+            with self.subTest(name):
+                response = self.client.get(f"/view/{name}")
+
+                self.assertEqual(response.status_code, 200)
+                self.assertIn(f'src="/svg/{name}"'.encode(), response.data)
+                self.assertIn(f'new EventSource("/updates/{name}")'.encode(), response.data)
+
+    def test_svg_view_and_updates_reject_unknown_names(self):
+        for name in ("progress.txt", "{{ 7 * 7 }}", "Filaments.svg<script>", "filaments.svg"):
+            for route in ("/view/", "/updates/"):
+                with self.subTest(route=route, name=name):
+                    response = self.client.get(route + quote(name))
+
+                    self.assertEqual(response.status_code, 404)
+                    self.assertNotIn(b"49", response.data)
+                    self.assertNotIn(b"<script>", response.data)
+
+    def test_svg_updates_stream_known_files(self):
+        self._write("Filaments.svg", "<svg/>")
+
+        response = self.client.get("/updates/Filaments.svg")
+        try:
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.mimetype, "text/event-stream")
+        finally:
+            response.close()
 
 
 if __name__ == "__main__":
