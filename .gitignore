@@ -7,8 +7,8 @@ venv/
 # Ignore environment variables
 .env
 
-# Ignore data folder contents
-data/
+# Ignore the legacy runtime data folder, not native/data, which ships with the plugin
+/data/
 
 # Optionally, ignore Python compiled files or other IDE specific files
 *.pyc

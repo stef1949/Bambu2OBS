@@ -14,22 +14,23 @@ static double clamp_double(double value, double minimum, double maximum)
     return value;
 }
 
-static bool copy_if_changed(char *destination, size_t capacity, const char *value)
+bool bambu_copy_text(char *destination, size_t capacity, const char *value)
 {
     const char *source = value != NULL ? value : "";
-    size_t source_length;
+    size_t length;
 
-    if (capacity == 0)
+    if (destination == NULL || capacity == 0)
         return false;
-
-    source_length = strlen(source);
-    if (source_length >= capacity)
-        source_length = capacity - 1;
-    if (strlen(destination) == source_length && memcmp(destination, source, source_length) == 0)
+    length = strlen(source);
+    if (length >= capacity) {
+        length = capacity - 1;
+        while (length > 0 && ((unsigned char)source[length] & 0xC0) == 0x80)
+            length--;
+    }
+    if (strncmp(destination, source, length) == 0 && destination[length] == '\0')
         return false;
-
-    memcpy(destination, source, source_length);
-    destination[source_length] = '\0';
+    memcpy(destination, source, length);
+    destination[length] = '\0';
     return true;
 }
 
@@ -103,9 +104,9 @@ bool bambu_snapshot_apply(
     }
 
     if (update->has_job_name)
-        changed = copy_if_changed(snapshot->job_name, sizeof(snapshot->job_name), update->job_name) || changed;
+        changed = bambu_copy_text(snapshot->job_name, sizeof(snapshot->job_name), update->job_name) || changed;
     if (update->has_stage)
-        changed = copy_if_changed(snapshot->stage, sizeof(snapshot->stage), update->stage) || changed;
+        changed = bambu_copy_text(snapshot->stage, sizeof(snapshot->stage), update->stage) || changed;
 
     if (changed) {
         snapshot->revision++;
@@ -145,6 +146,27 @@ const char *bambu_connection_state_name(enum bambu_connection_state state)
         return "authentication_failed";
     case BAMBU_CONNECTION_ERROR:
         return "error";
+    default:
+        return "unknown";
+    }
+}
+
+const char *bambu_job_state_name(enum bambu_job_state state)
+{
+    switch (state) {
+    case BAMBU_JOB_IDLE:
+        return "idle";
+    case BAMBU_JOB_PREPARING:
+        return "preparing";
+    case BAMBU_JOB_PRINTING:
+        return "printing";
+    case BAMBU_JOB_PAUSED:
+        return "paused";
+    case BAMBU_JOB_FINISHED:
+        return "finished";
+    case BAMBU_JOB_FAILED:
+        return "failed";
+    case BAMBU_JOB_UNKNOWN:
     default:
         return "unknown";
     }

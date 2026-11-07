@@ -5,7 +5,7 @@
   #define MyOutputDir "."
 #endif
 #ifndef MyVersion
-  #define MyVersion "0.2.0-preview.1"
+  #define MyVersion "0.3.0"
 #endif
 
 [Setup]
@@ -27,21 +27,29 @@ RestartApplications=no
 OutputDir={#MyOutputDir}
 OutputBaseFilename=Bambu-Printer-Overlay-{#MyVersion}-Windows-x64-Setup
 UninstallDisplayName=Bambu Printer Overlay
-VersionInfoVersion=0.2.0.0
-VersionInfoDescription=Bambu Printer Overlay OBS plugin preview installer
+VersionInfoVersion={#MyVersion}.0
+VersionInfoDescription=Bambu Printer Overlay OBS plugin installer
 
 [Files]
 Source: "{#MySourceRoot}\bambu-printer-overlay\*"; DestDir: "{app}\bambu-printer-overlay"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; The bin folder is the pre-OBS 33 layout used by earlier builds.
+Type: filesandordirs; Name: "{app}\bambu-printer-overlay\bin"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\bambu-printer-overlay"
 
 [Code]
 function InitializeSetup(): Boolean;
+var
+  ResultCode: Integer;
 begin
-  if FindWindowByClassName('Qt5152QWindowIcon') <> 0 then
+  { tasklist exits 0 either way, so find.exe supplies the answer. }
+  Exec(ExpandConstant('{cmd}'), '/C tasklist /FI "IMAGENAME eq obs64.exe" | find /I "obs64.exe"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ResultCode = 0 then
   begin
-    MsgBox('Close OBS Studio before installing Bambu Printer Overlay.', mbError, MB_OK);
+    SuppressibleMsgBox('Close OBS Studio before installing Bambu Printer Overlay.', mbError, MB_OK, IDOK);
     Result := False;
   end
   else

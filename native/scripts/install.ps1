@@ -38,6 +38,21 @@ if ([string]::IsNullOrWhiteSpace($resolvedRoot) -or $resolvedRoot.Length -lt 4) 
     throw 'The OBS plugin root is invalid.'
 }
 $programDataRoot = [IO.Path]::GetFullPath($env:ProgramData).TrimEnd('\') + '\'
+
+# OBS before 33 does not look for this layout, so the plugin would silently not load.
+if ($resolvedRoot.StartsWith($programDataRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    $obsInstall = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\OBS Studio' -ErrorAction SilentlyContinue).'(default)'
+    if ($obsInstall) {
+        $obsExecutable = Join-Path $obsInstall 'bin\64bit\obs64.exe'
+        if (Test-Path -LiteralPath $obsExecutable -PathType Leaf) {
+            $obsMajor = (Get-Item -LiteralPath $obsExecutable).VersionInfo.FileMajorPart
+            if ($obsMajor -lt 33) {
+                throw "Bambu Printer Overlay needs OBS Studio 33 or newer. Update OBS first (found major version $obsMajor)."
+            }
+        }
+    }
+}
+
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
 if (
