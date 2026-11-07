@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath($PackageRoot)
 $pluginRoot = Join-Path $root 'bambu-printer-overlay'
-$dllPath = Join-Path $pluginRoot 'bin\64bit\bambu-printer-overlay.dll'
+$dllPath = Join-Path $pluginRoot 'bambu-printer-overlay.dll'
 $localePath = Join-Path $pluginRoot 'data\locale\en-US.ini'
 $requiredFiles = @(
     $dllPath,
@@ -44,6 +44,14 @@ if ($machine -ne 0x8664) {
     throw ('Plugin DLL is not x64 (machine 0x{0:X4}).' -f $machine)
 }
 
+# The plugin uses only OBS and components of Windows, so nothing may ride along.
+# Anything else at this level, such as a bin folder, is not the OBS 33 layout.
+$unexpectedEntries = Get-ChildItem -LiteralPath $pluginRoot |
+    Where-Object { $_.Name -notin @('bambu-printer-overlay.dll', 'data') }
+if ($unexpectedEntries) {
+    throw "Unexpected entries beside the plugin DLL: $($unexpectedEntries.Name -join ', ')"
+}
+
 $forbiddenExtensions = @('.py', '.pyc', '.pyo', '.pyd')
 $forbiddenFiles = Get-ChildItem -LiteralPath $pluginRoot -Recurse -File | Where-Object {
     $forbiddenExtensions -contains $_.Extension.ToLowerInvariant()
@@ -57,7 +65,7 @@ $developerPathMatches = $textFiles | Select-String -Pattern 'C:\\Users\\[^\\]+\\
 if ($developerPathMatches) {
     throw "Developer-specific paths were found in the package: $($developerPathMatches.Path -join ', ')"
 }
-$secretMatches = $textFiles | Select-String -Pattern '(?i)(ACCESS_CODE|BAMBU_CLOUD_TOKEN|PASSWORD)\s*=\s*[^\s\{]' -ErrorAction SilentlyContinue
+$secretMatches = $textFiles | Select-String -Pattern '(?i)(ACCESS_CODE|BAMBU_CLOUD_TOKEN|PASSWORD)\s*=\s*[^\s\{<]' -ErrorAction SilentlyContinue
 if ($secretMatches) {
     throw "Possible credential assignment was found in the package: $($secretMatches.Path -join ', ')"
 }

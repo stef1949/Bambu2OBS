@@ -1,49 +1,46 @@
-# Bambu Printer Overlay 0.2.0 Preview
+# Bambu Printer Overlay
 
-This package installs the native **Bambu Printer Overlay** source for OBS Studio on Windows x64.
+A native OBS Studio source showing live telemetry from a Bambu Lab 3D printer. It needs only OBS 33 or newer on 64-bit Windows.
 
-> Preview limitation: this build renders deterministic simulation data only. It proves the native OBS module, source registration, rendering, properties, installation layout, and unload path. Live printer MQTT, preview retrieval, and connection-profile support remain in the legacy Python application and are not included in this native package.
+This is a community plugin, not affiliated with or endorsed by OBS Project or Bambu Lab.
 
-The project is community-maintained and is not affiliated with or endorsed by OBS Project or Bambu Lab.
+## Install
 
-## Installer
+Close OBS, then either:
 
-1. Close OBS Studio.
-2. Run `Bambu-Printer-Overlay-0.2.0-preview.1-Windows-x64-Setup.exe` as an administrator.
-3. Start OBS Studio.
-4. Add a source and select **Bambu Printer Overlay**.
+- run the `Setup.exe` installer as administrator, or
+- right-click `install.ps1` in this folder, choose **Run with PowerShell**, and approve the prompt.
 
-## Portable ZIP
-
-1. Extract the ZIP.
-2. Close OBS Studio.
-3. Right-click `install.ps1`, choose **Run with PowerShell**, and approve elevation if requested.
-4. Start OBS Studio and add **Bambu Printer Overlay** as a source.
-
-The default destination is:
+The default location is:
 
 ```text
 C:\ProgramData\obs-studio\plugins\bambu-printer-overlay
 ```
 
-For a portable or custom OBS installation, run an elevated PowerShell and provide the plugin root:
+For a portable OBS, pass the `plugins` folder in its install root:
 
 ```powershell
-.\install.ps1 -ObsPluginRoot 'D:\OBS\config\obs-studio\plugins'
+.\install.ps1 -ObsPluginRoot 'D:\OBS\plugins'
 ```
+
+## Set up
+
+1. In OBS open **Tools > Bambu Printer Overlay Settings**, press **Add**, and enter the printer's IP, serial number, and LAN access code.
+2. Press **Save**, then **Test Connection**, and accept the printer's certificate.
+3. Add a **Bambu Printer Overlay** source and choose your printer.
 
 ## Upgrade and uninstall
 
-Close OBS before upgrading. Running a newer installer replaces the plugin files. The ZIP installer backs up an existing folder before replacement.
+Close OBS before either. Installing a newer version replaces the plugin; the ZIP installer backs up the existing folder first. To remove it, run `uninstall.ps1` as administrator.
 
-Use **Installed apps** for the EXE installer, or run the ZIP package's `uninstall.ps1` as administrator.
+Profiles are kept in your OBS configuration folder and access codes in Windows Credential Manager. Removing a profile in the settings deletes its stored secrets.
 
 ## Troubleshooting
 
-If the source is absent, open **Help > Log Files > View Current Log** and search for `bambu-printer-overlay`. Confirm that OBS is 64-bit and that the DLL exists at:
+If the source is missing, open **Help > Log Files > View Current Log** and search for `bambu-printer-overlay`. Confirm OBS is 64-bit, version 33 or newer, and the DLL exists at:
 
 ```text
-C:\ProgramData\obs-studio\plugins\bambu-printer-overlay\bin\64bit\bambu-printer-overlay.dll
+C:\ProgramData\obs-studio\plugins\bambu-printer-overlay\bambu-printer-overlay.dll
 ```
 
-Unsigned preview installers can trigger Microsoft Defender SmartScreen. Review the published SHA-256 checksum before running the installer.
+The installer is not code-signed, so Microsoft Defender SmartScreen may warn about it. Check the published SHA-256 checksum before running it.

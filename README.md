@@ -1,184 +1,435 @@
 # Bambu2OBS
 
-Bambu2OBS connects a Bambu Lab 3D printer to OBS Studio and displays live print progress, job metadata, temperatures, layers, speed, and preview artwork.
+**Live Bambu Lab printer telemetry as a native OBS Studio source. No Python, no Browser Source, no localhost server.**
 
-The live printer implementation is currently a Windows-friendly Python companion application. It connects to the printer over local MQTT and FTPS, optionally uses Bambu Cloud for job metadata, and serves a local OBS Browser Source.
+[![Version](https://img.shields.io/badge/version-0.3.0-2f81f7)](CHANGELOG.md)
+[![C11](https://img.shields.io/badge/C-11-00599C?logo=c&logoColor=white)](native/CMakeLists.txt)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](native/CMakeLists.txt)
+[![Qt 6](https://img.shields.io/badge/Qt-6-41CD52?logo=qt&logoColor=white)](docs/ARCHITECTURE.md#decision-a-qt-settings-dialog)
+[![OBS Studio 33+](https://img.shields.io/badge/OBS%20Studio-33%2B-302E31?logo=obsstudio&logoColor=white)](https://obsproject.com/)
+[![Windows x64](https://img.shields.io/badge/Windows-10%20%7C%2011%20x64-0078D4)](#requirements)
+[![Python 3.11-3.13 (legacy app)](https://img.shields.io/badge/Python%20%28legacy%20app%29-3.11%20%7C%203.12%20%7C%203.13-3776AB?logo=python&logoColor=white)](docs/LEGACY_PYTHON.md)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](#license)
+[![CI](https://github.com/stef1949/Bambu2OBS/actions/workflows/native-package.yml/badge.svg?branch=master)](https://github.com/stef1949/Bambu2OBS/actions/workflows/native-package.yml)
 
-An installable Windows x64 native preview is also built under [`native/`](native/). It loads directly in OBS without Python, Flask, localhost, or a Browser Source, but currently renders simulation data only. It is provided to validate installation and native OBS integration, not as a live-printer replacement yet.
+![Bambu Printer Overlay running in OBS Studio](images/obs-main-window.png)
 
-## Current features
+**Bambu Printer Overlay** draws your printer's progress, temperatures, and AMS trays as one transparent broadcast graphic. It runs entirely inside OBS as a single DLL, and live data comes straight from the printer over your local network. Bambu Cloud is optional.
 
-- Local MQTT telemetry with bounded reconnect backoff.
-- Optional Bambu Cloud job name and preview retrieval.
-- SD-card `.3mf` preview fallback with archive and image safety limits.
-- Consolidated, transparent progress overlay with live/stale/offline status.
-- Temperatures, layer count, remaining time, stage, speed, and print artwork.
-- Multiple AMS units in the output data model, with legacy aliases for the first AMS.
-- Atomic state writes so OBS and Flask do not read partially written files.
-- TLS certificate pinning for self-signed printer services.
+> [!IMPORTANT]
+> **Pre-release.** Version 0.3.0 has no tagged release yet and has not been tested against a physical printer. It has only run against a simulated printer, so please expect rough edges. See [Validation status](native/README.md#validation-status).
 
-## Install the native OBS preview
+> This is a community plugin. It is not affiliated with or endorsed by OBS Project or Bambu Lab.
 
-The native preview requires 64-bit OBS Studio on Windows. It does not require Python or this repository at runtime.
+## Contents
 
-1. Close OBS Studio.
-2. Run `release\Bambu-Printer-Overlay-0.2.0-preview.1-Windows-x64-Setup.exe`.
-3. Approve the administrator prompt. The installer writes to `C:\ProgramData\obs-studio\plugins`.
-4. Start OBS Studio.
-5. Select **Sources > + > Bambu Printer Overlay**.
+- [Features](#features)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Documentation](#documentation)
+- [Development and testing](#development-and-testing)
+- [Contributing](#contributing)
+- [License](#license)
 
-The installer is an unsigned development build, so Windows may display a SmartScreen warning. Verify the adjacent `.sha256` file before running it. A portable ZIP with a hash-verifying `install.ps1` is also generated. See [native/PACKAGE_README.md](native/PACKAGE_README.md) for custom paths, upgrades, and uninstall instructions.
+## Features
 
-> The native preview's simulation warning is also displayed inside its OBS properties. Continue using the Python version below for live printer telemetry.
+- **Live telemetry:** progress, time left, finish time, stage, layers, temperatures, fan, and speed
+- **AMS trays:** material, colour, and the active slot, across multiple AMS units
+- **Print previews:** from Bambu Cloud, or from the `.3mf` on the printer
+- **Three presets:** Compact, Dashboard, and Expanded
+- **Four themes:** dark, light, high contrast, and custom colours
+- **Honest states:** `LIVE`, `STALE`, `RECONNECTING`, and `OFFLINE`, keeping the last known values on screen
+- **Readable on stream:** text stays large enough for a 720p stream, and small sources show less rather than shrinking it
+- **One connection per printer:** several overlays on the same printer share it
+- **Credentials kept out of scene files:** access codes stay in Windows Credential Manager, and you approve each printer's certificate before anything is sent
+- **Simulation mode:** sample data for every state, with no printer and no network use
 
-## Python-version requirements
+**Presets**
 
-- Windows 10 or 11.
-- Python 3.11 or newer.
-- OBS Studio.
-- A Bambu printer with LAN access enabled.
+| Compact | Expanded, two AMS units |
+| --- | --- |
+| ![Compact preset](images/overlay-compact.png) | ![Expanded preset](images/overlay-expanded.png) |
 
-Inkscape, VS Code, and Bambu Cloud are not required at runtime.
+**Themes**
 
-## Install the current Python version
+| Light | High contrast | Custom |
+| --- | --- | --- |
+| ![Light theme](images/overlay-theme-light.png) | ![High-contrast theme](images/overlay-theme-high-contrast.png) | ![Custom theme](images/overlay-theme-custom.png) |
 
-Open PowerShell in the repository directory:
+**States**
 
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-Copy-Item example.env .env
-```
+| Stale data | Printer offline |
+| --- | --- |
+| ![Stale state](images/overlay-state-stale.png) | ![Offline state](images/overlay-state-offline.png) |
 
-Edit `.env` and set at least:
+Stale and offline overlays grey out the progress bar and hide the finish time, because a clock time based on old data would be a guess. Shape shows state as well as colour: the status dot is filled when live and a ring when not.
 
-```dotenv
-PRINTER_SN=your_printer_serial_number
-PRINTER_IP=192.0.2.10
-ACCESS_CODE=your_access_code
-BASE_DIR=data
-```
+### Known limitations
 
-`EMAIL`, `PASSWORD`, and `BAMBU_CLOUD_TOKEN` are optional. LAN telemetry continues to work when cloud authentication is unavailable.
+- Windows only.
+- Not yet tested against a physical printer.
+- Stage and material names are English only, as they come from a fixed table.
+- Removing a stored cloud token currently means deleting and re-adding the profile.
 
-## Choose a printer TLS trust mode
+## Installation
 
-Bambu printer LAN services commonly use a self-signed certificate. Choose one of these modes explicitly.
+### Requirements
 
-### Preferred: pin the printer certificate
+- Windows 10 or 11, 64-bit
+- OBS Studio 33 or newer, which is the first version to use this plugin layout
+- A Bambu Lab printer on the same network, with LAN access available
 
-Set `PRINTER_TLS_FINGERPRINT_SHA256` to the 64-character SHA-256 fingerprint of the printer certificate. Colons and letter case are ignored.
+### Get the package
 
-The following PowerShell obtains the certificate presented by MQTT port 8883. Review that you are connected to the intended printer before trusting the value:
+There is no tagged release yet. Once there is, the installer, ZIP, and checksums will be on the [Releases page](https://github.com/stef1949/Bambu2OBS/releases). Until then, [build the package](#build) yourself, or download `Bambu-Printer-Overlay-Windows-x64` from a successful [CI run](https://github.com/stef1949/Bambu2OBS/actions/workflows/native-package.yml). Packages aren't code-signed, so Windows may show a SmartScreen warning. Check them against the `.sha256` file beside them.
 
-```powershell
-$printerAddress = '192.0.2.10'
-$tcpClient = [Net.Sockets.TcpClient]::new($printerAddress, 8883)
-$acceptCertificate = { param($sender, $certificate, $chain, $errors) $true }
-$tlsStream = [Net.Security.SslStream]::new($tcpClient.GetStream(), $false, $acceptCertificate)
-$tlsStream.AuthenticateAsClient($printerAddress)
-$certificateBytes = $tlsStream.RemoteCertificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-$sha256 = [Security.Cryptography.SHA256]::Create()
-$fingerprint = [BitConverter]::ToString($sha256.ComputeHash($certificateBytes)).Replace('-', '')
-$sha256.Dispose()
-$fingerprint
-$tlsStream.Dispose()
-$tcpClient.Dispose()
-```
+### Installer
 
-Copy the result into `.env`:
+1. Close OBS.
+2. Run `Bambu-Printer-Overlay-<version>-Windows-x64-Setup.exe` and approve the administrator prompt.
+3. Start OBS.
 
-```dotenv
-PRINTER_TLS_FINGERPRINT_SHA256=0123456789ABCDEF...
-ALLOW_INSECURE_PRINTER_TLS=false
-```
+The plugin installs to `C:\ProgramData\obs-studio\plugins\bambu-printer-overlay`.
 
-### Compatibility exception
+### ZIP
 
-If pinning is not currently possible, the following explicit exception retains encryption but does not verify printer identity:
-
-```dotenv
-PRINTER_TLS_FINGERPRINT_SHA256=
-ALLOW_INSECURE_PRINTER_TLS=true
-```
-
-Use this only on a trusted private network. See [SECURITY.md](SECURITY.md).
-
-## Optional cloud metadata
-
-For unattended use, prefer a token:
-
-```dotenv
-REGION=global
-BAMBU_CLOUD_TOKEN=your_token
-```
-
-If the token is empty, the application can try `EMAIL` and `PASSWORD`. Accounts requiring an interactive verification code should use a token. Cloud credentials are never sent to third-party preview hosts.
-
-## Run
-
-With the virtual environment activated:
+Extract the ZIP, close OBS, then run this from an elevated PowerShell window in that folder:
 
 ```powershell
-python .\src\bambu2obs.py
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The process starts the local overlay server, checks that it is listening, obtains initial metadata, and then enters the MQTT loop. Stop it with `Ctrl+C`.
+The script checks every file against the package manifest, refuses to run while OBS is open, and backs up any existing copy.
 
-The server listens only on `127.0.0.1`. Its port defaults to `5000` and can be changed with `PROGRESS_SERVER_PORT`.
+### Optional extras
 
-## Add the overlay to OBS
+None of these are needed for live telemetry.
 
-Add a Browser Source using one of these local URLs:
+| Extra | What it adds | How to get it |
+| --- | --- | --- |
+| **Bambu Cloud** | Cover images, design titles, and total time and weight for cloud prints | Add a cloud token in the [settings dialog](#printer-profiles) and untick **LAN only** |
+| **Portable OBS** | Install into a portable copy of OBS | Add `-ObsPluginRoot 'D:\OBS\plugins'` to the ZIP install command, using the `plugins` folder in its install root |
+| **Automation** | Control overlays from scripts and tools | Built into OBS. See [Usage](#usage) |
+| **Legacy Python app** | The original Flask version, kept for reference | `python -m pip install -r requirements.txt`, then see [`docs/LEGACY_PYTHON.md`](docs/LEGACY_PYTHON.md) |
 
-- Consolidated overlay: `http://127.0.0.1:5000/view/progressbar`
-- Print artwork only: `http://127.0.0.1:5000/view/printpreview`
-- AMS overview: `http://127.0.0.1:5000/view/Filaments.svg`
-- Active filament: `http://127.0.0.1:5000/view/ActiveFilament.svg`
+### Upgrade and uninstall
 
-Use a transparent Browser Source and choose dimensions appropriate for the scene; `760 × 180` is a practical starting point for the consolidated overlay.
+To upgrade, close OBS and install the newer version over the old one. Moving from the Python version? See the [migration guide](docs/MIGRATION.md).
 
-The file at [`obs_template/Bambu2OBS_Scene.json`](obs_template/Bambu2OBS_Scene.json) is a legacy example containing machine-specific paths. It is not the recommended installation method and will be replaced by the native single-source workflow.
+To uninstall, close OBS and run this from an elevated PowerShell window:
 
-## Diagnostics
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\ProgramData\obs-studio\plugins\bambu-printer-overlay\data\uninstall.ps1'
+```
 
-While the application is running:
+## Quick start
 
-- `http://127.0.0.1:5000/diagnostics/progress`
-- `http://127.0.0.1:5000/diagnostics/writer`
+### 1. See it working, with no printer
 
-The overlay marks data stale after 30 seconds by default. Change this with `OVERLAY_STALE_AFTER_SECONDS`.
+1. In a scene, choose **Sources > + > Bambu Printer Overlay**, then **OK**.
+2. In the properties window, scroll to **Diagnostics**, tick **Simulation mode**, and set **Simulated state** to **Printing**.
+3. Press **OK**, then drag the overlay to where you want it.
 
-`DEBUG_DUMPS=true` stores at most five diagnostic MQTT entries. Common credential fields are redacted, but always inspect diagnostics before sharing them.
+You'll see the overlay from the top of this page, marked `SIMULATED`. The background is transparent, so place it above your camera or printer feed.
 
-## Test
+### 2. Connect your printer
+
+On the printer, find its **IP address** and **LAN access code** in the network settings, and its **serial number** in the device information. Treat the access code like a password.
+
+1. In OBS open **Tools > Bambu Printer Overlay Settings** and press **Add**.
+2. Fill in the details, then press **Save**.
+3. Press **Test Connection**. OBS shows the printer's certificate fingerprint. Confirm the address is your printer and accept.
+
+![Settings dialog with a sample printer profile](images/settings-dialog.png)
+
+*The values shown are samples: `192.0.2.50` is an address reserved for documentation.*
+
+![Certificate approval prompt](images/trust-prompt.png)
+
+Printers use their own certificates, which only you can vouch for, so nothing is sent until you accept. Your access code then goes only to that certificate.
+
+### 3. Go live
+
+Open the source's properties, untick **Simulation mode**, and choose your printer under **Connection**. The badge on the overlay changes to `LIVE` once data arrives.
+
+## Usage
+
+Most people only need the properties window. To automate overlays, use the source through OBS's own interfaces.
+
+### Source reference
+
+The plugin has no C API of its own. Everything is reached through this OBS source:
+
+| | |
+| --- | --- |
+| **Source ID** | `bambu_printer_overlay` |
+| **Settings** | Every key in the [settings reference](#source-settings) |
+| **Printer list** | The items of the `profile_id` list property |
+| **Buttons** | `reconnect`, `open_settings`, `export_diagnostics` |
+
+Three things to know:
+
+- **Set the size with the preset.** Changing `layout_preset` from code does not resize the source, so send `source_width` and `source_height` too. Only the properties window applies the preset's size for you.
+- **Colours are `0xAABBGGRR` integers,** not `0xRRGGBB`. See the helper below.
+- **Secrets and telemetry are not exposed.** Scripts can't set an access code or read printer data. Add printers in the settings dialog.
+
+### Python, through obs-websocket
+
+obs-websocket ships with OBS. Turn it on under **Tools > WebSocket Server Settings**, then install a client:
+
+```shell
+pip install obsws-python
+```
+
+```python
+import obsws_python as obs
+
+client = obs.ReqClient(host="localhost", port=4455, password="your-password")
+scene = client.get_current_program_scene().scene_name
+overlay = "Printer Overlay"
+
+# Add an overlay showing sample data.
+client.create_input(
+    scene,
+    overlay,
+    "bambu_printer_overlay",
+    {"simulation_mode": True, "simulation_fixture": 1},
+    True,
+)
+
+# List the printers from Tools > Bambu Printer Overlay Settings.
+# The first item is the "(choose a printer)" placeholder.
+printers = client.get_input_properties_list_property_items(overlay, "profile_id").property_items
+for printer in printers[1:]:
+    print(printer["itemName"], printer["itemValue"])
+
+# Switch to the Compact preset, sending its size as well.
+client.set_input_settings(
+    overlay,
+    {"layout_preset": "compact", "source_width": 640, "source_height": 104},
+    True,
+)
+
+
+# Use a custom accent colour.
+def obs_color(hex_rgb):
+    red, green, blue = bytes.fromhex(hex_rgb.lstrip("#"))
+    return 0xFF000000 | blue << 16 | green << 8 | red
+
+
+client.set_input_settings(overlay, {"accent_color": obs_color("#FFA500")}, True)
+
+# Connect to the first printer, then force a reconnect.
+if len(printers) > 1:
+    client.set_input_settings(
+        overlay,
+        {"profile_id": printers[1]["itemValue"], "simulation_mode": False},
+        True,
+    )
+    client.press_input_properties_button(overlay, "reconnect")
+```
+
+### Lua, as an OBS script
+
+Save this as `overlay-layout.lua` and add it under **Tools > Scripts**. It adds two layout buttons:
+
+```lua
+local obs = obslua
+local SOURCE_NAME = "Printer Overlay"
+
+local function apply_layout(preset, width, height)
+    local source = obs.obs_get_source_by_name(SOURCE_NAME)
+    if source == nil then
+        return
+    end
+
+    local settings = obs.obs_data_create()
+    obs.obs_data_set_string(settings, "layout_preset", preset)
+    obs.obs_data_set_int(settings, "source_width", width)
+    obs.obs_data_set_int(settings, "source_height", height)
+    obs.obs_source_update(source, settings)
+
+    obs.obs_data_release(settings)
+    obs.obs_source_release(source)
+end
+
+function script_description()
+    return "Switch the printer overlay between layouts."
+end
+
+function script_properties()
+    local props = obs.obs_properties_create()
+    obs.obs_properties_add_button(props, "compact", "Compact", function()
+        apply_layout("compact", 640, 104)
+    end)
+    obs.obs_properties_add_button(props, "dashboard", "Dashboard", function()
+        apply_layout("dashboard", 960, 260)
+    end)
+    return props
+end
+```
+
+## Configuration
+
+### Printer profiles
+
+Add printers under **Tools > Bambu Printer Overlay Settings**, shown in the [quick start](#2-connect-your-printer).
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| **Profile name** | No | The name shown in the source's printer list. Defaults to the address |
+| **Printer IP or host** | Yes | A DHCP reservation stops it changing |
+| **Serial number** | Yes | From the printer's device information |
+| **LAN access code** | Yes | Changes if LAN mode is toggled or the printer is reset |
+| **Fetch print previews** | No | Reads the `.3mf` from the printer, or cover images from the cloud |
+| **LAN only** | No | Blocks all Bambu Cloud requests |
+| **Cloud token** | No | Enables cloud previews and details. Untick **LAN only** to use it |
+| **China region** | No | Uses the China cloud service |
+
+| Stored item | Location |
+| --- | --- |
+| Access codes and cloud tokens | Windows Credential Manager, under `bambu-printer-overlay/<profile-id>/` |
+| Profiles and approved certificate fingerprints | `%APPDATA%\obs-studio\plugin_config\bambu-printer-overlay\profiles.json` |
+| Preview cache | The `cache` folder beside `profiles.json` |
+
+Removing a profile deletes its stored secrets. Scene collections only hold the `profile_id`.
+
+### Source settings
+
+Each source has its own settings, in its properties window. The tables give the keys for [automation](#usage).
+
+#### Connection and layout
+
+![Connection and Layout settings](images/properties-connection-layout.png)
+
+| Key | Type | Default | Values |
+| --- | --- | --- | --- |
+| `profile_id` | string | empty | A printer's ID. See [Source reference](#source-reference) |
+| `layout_preset` | string | `dashboard` | `compact` (640x104), `dashboard` (960x260), `expanded` (960x400) |
+| `source_width` | int | `960` | 320 to 3840 |
+| `source_height` | int | `260` | 72 to 2160 |
+| `density` | float | `1.0` | 0.6 to 1.6 |
+| `ams_mode` | int | `1` | `0` first AMS, `1` active AMS, `2` all AMS units |
+| `show_preview`, `show_ams`, `show_stage`, `show_layers` | bool | `true` | Show or hide the section |
+| `show_temperatures`, `show_fan`, `show_speed`, `show_badge` | bool | `true` | Show or hide the section |
+| `show_total_time`, `show_total_weight` | bool | `true` | Show or hide the section, in Expanded only |
+
+#### Appearance
+
+![Appearance settings](images/properties-appearance.png)
+
+| Key | Type | Default | Values |
+| --- | --- | --- | --- |
+| `theme` | int | `0` | `0` dark, `1` light, `2` high contrast, `3` custom |
+| `accent_color` | int | `0xFF42AE00` | `0xAABBGGRR`. The default is `#00AE42` |
+| `background_color` | int | `0xFF1A1612` | `0xAABBGGRR`, used by the custom theme |
+| `text_color` | int | `0xFFF8F6F3` | `0xAABBGGRR`, used by the custom theme |
+| `panel_opacity` | float | `94.0` | 30 to 100 percent |
+| `corner_radius` | int | `14` | 0 to 40 |
+| `padding` | int | `16` | 6 to 32 |
+| `font_scale` | float | `1.0` | 0.7 to 1.4 |
+| `reduce_motion` | bool | `false` | Jump to new progress values instead of animating |
+
+#### Formatting and diagnostics
+
+![Formatting and Diagnostics settings](images/properties-formatting-diagnostics.png)
+
+| Key | Type | Default | Values |
+| --- | --- | --- | --- |
+| `temperature_unit` | int | `0` | `0` Celsius, `1` Fahrenheit |
+| `temperature_decimals` | int | `0` | 0 to 2 |
+| `time_format` | int | `24` | `24` or `12` |
+| `show_clock_eta` | bool | `true` | Show the finish time beside the time left |
+| `stale_seconds` | int | `30` | 5 to 600. Data older than this is marked stale |
+| `simulation_mode` | bool | `false` | Show sample data, with no network use |
+| `simulation_fixture` | int | `0` | See below |
+
+`simulation_fixture` values: `0` cycle through all, `1` printing, `2` preparing, `3` paused, `4` finished, `5` failed, `6` idle, `7` two AMS units, `8` very long names, `9` stale, `10` reconnecting, `11` offline, `12` authentication failed.
+
+### Keep it readable on stream
+
+The presets are sized for a 1920x1080 canvas, where the smallest text is 18 px, or 12 px on a 720p stream.
+
+- **Keep the source at its preset size or larger.** If you make it smaller, set **Width** and **Height** in the source's properties, not by dragging its corners. The overlay then drops detail to keep text readable, and Dashboard or Expanded steps down to Compact below about 816 pixels wide. Dragging the corners in the scene only scales the finished image, so the text shrinks with it.
+- **On a 1440p or 4K canvas,** scale the source up to match, by 1.33 or 2.
+- **Leave Density and Font scale at 1.0 or above.** Lower values take text under the 18 px floor.
+
+## Documentation
+
+| Guide | Covers |
+| --- | --- |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Connection states, certificates, previews, and missing sources |
+| [Architecture](docs/ARCHITECTURE.md) | Design decisions, threading, the trust model, and readability |
+| [Migration](docs/MIGRATION.md) | Moving from the Python version |
+| [Contributor guide](native/README.md) | Build details, tests, package layout, and validation status |
+| [Security policy](SECURITY.md) | Credential handling, TLS trust, and reporting a vulnerability |
+| [Changelog](CHANGELOG.md) | What changed in each version |
+| [Legacy Python app](docs/LEGACY_PYTHON.md) | Running the original implementation |
+
+## Development and testing
+
+### Build
+
+You need Visual Studio 2022 Build Tools with the x64 C and C++ toolchain, the Windows SDK 10.0.20348 or newer, CMake 3.28 or newer, and Git. The integration tests also need Python 3 and OpenSSL.
+
+```powershell
+cd native
+cmake --preset windows-x64
+cmake --build --preset windows-x64
+ctest --preset windows-x64
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 -Configuration Release
+```
+
+The first configure downloads and builds the pinned OBS sources into `native/.deps`, and later builds reuse them. The installer and ZIP land in `release/`.
+
+### Test
+
+`ctest` runs seven suites, covering the protocol code, rendering, the real network clients against a fake printer, the settings dialog and its certificate prompt, and the plugin inside real libobs.
+
+To add the GPU checks, point the load test at an installed OBS:
+
+```powershell
+cmake --preset windows-x64 -DBAMBU_OVERLAY_TEST_OBS_DIR="C:/Program Files/obs-studio"
+```
+
+The core and its tests also build without OBS:
+
+```powershell
+cmake --preset core-tests
+cmake --build --preset core-tests
+ctest --preset core-tests
+```
+
+To review visual changes, `bambu-overlay-gallery <directory>` renders every preset and state to PNG.
+
+The legacy Python app has its own tests:
 
 ```powershell
 python -m pip install -r requirements-dev.txt
-python -m compileall -q src tests
 python -m unittest discover -s tests -v
-python -m pip check
 python -m ruff check src tests
 ```
 
-CI runs the same checks on supported Python versions. Printer, cloud-account, and OBS integration still require proportional live testing because unit tests do not contain real credentials or hardware access.
+## Contributing
 
-The native build additionally runs an OBS-independent snapshot test and a headless libobs integration test that opens the DLL, initializes the module, registers the source, creates its properties, and unloads it.
+Pull requests are welcome, and reports from real printers are the most useful contribution right now. If you try the plugin on your printer, please say which model and firmware you used, and what worked.
 
-## Native OBS plugin development
+1. Branch from `master`.
+2. Make your change, and add a test for it.
+3. Run `ctest --preset windows-x64`.
+4. Add an entry under **Unreleased** in [`CHANGELOG.md`](CHANGELOG.md).
+5. [Open a pull request](https://github.com/stef1949/Bambu2OBS/pulls).
 
-The native preview is kept separate from the working Python implementation until feature parity is demonstrated. Its CMake presets download only pinned, hash-verified OBS sources and development dependencies. The packaging script creates the recommended ProgramData-compatible layout, validates it, and emits an installer, portable ZIP, manifest, and SHA-256 sidecars.
+Please keep these rules:
 
-See [`native/README.md`](native/README.md) and [`OVERLAY_OVERHAUL_PROMPT.md`](OVERLAY_OVERHAUL_PROMPT.md) for build instructions, current scope, and the remaining acceptance requirements.
+- **Stay self-contained.** The package is one DLL that needs only OBS, including the Qt it ships, and Windows. Validation rejects anything else beside it.
+- **Keep it readable.** Don't draw text below `BAMBU_TEXT_MIN`, and judge visual changes through a [simulated stream](native/README.md#tests), not sharp renders.
+- **Never share secrets.** Remove access codes, tokens, and serial numbers from logs and screenshots. To report a vulnerability, follow the [security policy](SECURITY.md).
 
-Do not distribute a native build as production-ready until it has been built against a supported OBS version, loaded in OBS, tested during reconnect/shutdown, and validated with a real printer or sanitized protocol fixtures.
+## License
 
-## Attribution and license
+The source code is licensed under the [MIT License](LICENSE). Distributed plugin binaries link libobs, so they are distributed under GPL-2.0-or-later, and packages include that licence text. They use the Qt that ships with OBS and include no Qt code of their own beyond its headers. Details are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
-Bambu2OBS is based on the original work by [fluidman](https://github.com/fluidman). Local printer mappings use [Greg Hesp's pybambu](https://github.com/greghesp/pybambu), and optional cloud integration uses [coelacant1/Bambu-Lab-Cloud-API](https://github.com/coelacant1/Bambu-Lab-Cloud-API).
-
-The existing repository is licensed under the MIT License; see [LICENSE](LICENSE). The native preview links against libobs and its package includes the exact GPL text from the pinned OBS source dependency. The licensing approach still requires owner review before a stable public release; the root licence has not been silently changed.
-
-Direct dependency licence metadata and outstanding release-review requirements are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Bambu2OBS is based on the original work by [fluidman](https://github.com/fluidman). Printer identifier tables come from [Greg Hesp's pybambu](https://github.com/greghesp/pybambu), and the legacy app's cloud integration uses [coelacant1/Bambu-Lab-Cloud-API](https://github.com/coelacant1/Bambu-Lab-Cloud-API).

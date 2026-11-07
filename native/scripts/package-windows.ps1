@@ -51,7 +51,6 @@ $manifest = [pscustomobject]@{
     name = 'bambu-printer-overlay'
     version = $version
     architecture = 'windows-x64'
-    preview = $true
     files = @($manifestFiles)
 }
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $stagingRoot 'manifest.json') -Encoding UTF8
@@ -63,6 +62,10 @@ $zipPath = Join-Path $releaseRoot "$artifactBase.zip"
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
 Compress-Archive -Path (Join-Path $stagingRoot '*') -DestinationPath $zipPath -CompressionLevel Optimal
 
+# A named compiler must exist: falling back here would change the installer that ships.
+if ($InnoCompiler -and -not (Test-Path -LiteralPath $InnoCompiler -PathType Leaf)) {
+    throw "Inno Setup compiler not found: $InnoCompiler"
+}
 if (-not $InnoCompiler) {
     $innoCandidates = @(
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
@@ -70,7 +73,7 @@ if (-not $InnoCompiler) {
     )
     $InnoCompiler = $innoCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 }
-if ($InnoCompiler -and (Test-Path -LiteralPath $InnoCompiler)) {
+if ($InnoCompiler) {
     & $InnoCompiler "/DMySourceRoot=$stagingRoot" "/DMyOutputDir=$releaseRoot" "/DMyVersion=$version" (Join-Path $nativeRoot 'installer\BambuPrinterOverlay.iss')
     if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed.' }
 } else {
@@ -145,7 +148,8 @@ $artifacts = Get-ChildItem -LiteralPath $releaseRoot -File | Where-Object {
 foreach ($artifact in $artifacts) {
     $hashPath = "$($artifact.FullName).sha256"
     $hash = (Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    "$hash  $($artifact.Name)" | Set-Content -LiteralPath $hashPath -Encoding ASCII
+    # sha256sum -c reads a carriage return as part of the file name, so this must end in LF.
+    [IO.File]::WriteAllText($hashPath, "$hash  $($artifact.Name)`n", [Text.Encoding]::ASCII)
     Write-Output "Created $($artifact.FullName)"
     Write-Output "SHA-256 $hash"
 }
