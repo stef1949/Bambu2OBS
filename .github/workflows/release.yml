@@ -73,19 +73,25 @@ jobs:
         shell: pwsh
         run: ./native/scripts/prepare-release.ps1 -Tag $env:RELEASE_TAG -ReleaseRoot release -NotesPath "$env:RUNNER_TEMP/release-notes.md"
 
+      # Each lookup must succeed. A failed lookup stops the release instead of
+      # being read as "nothing there". The names are compared exactly.
       - name: Refuse to replace a release or build for a different commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "::error::$RELEASE_TAG already has a release. Delete it first, or use a new tag."
+          releases=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName')
+          if printf '%s\n' "$releases" | grep -Fxq -- "$RELEASE_TAG"; then
+            echo "::error::$RELEASE_TAG already has a release or a draft. Delete it first, or use a new tag."
             exit 1
           fi
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            tag_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$RELEASE_TAG" --jq .sha 2> /dev/null || true)
-            if [ -n "$tag_commit" ] && [ "$tag_commit" != "$GITHUB_SHA" ]; then
-              echo "::error::$RELEASE_TAG already points at $tag_commit, but this build is $GITHUB_SHA."
-              exit 1
+            tags=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --jq '.[].ref')
+            if printf '%s\n' "$tags" | grep -Fxq -- "refs/tags/$RELEASE_TAG"; then
+              tag_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$RELEASE_TAG" --jq .sha)
+              if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+                echo "::error::$RELEASE_TAG already points at $tag_commit, but this build is $GITHUB_SHA."
+                exit 1
+              fi
             fi
           fi
 

@@ -4,16 +4,6 @@ All notable changes to Bambu2OBS will be documented here.
 
 ## 0.3.0
 
-### Security
-
-- Updated the legacy Python tools' dependencies to fix the open Dependabot alerts: requests 2.34.2 (GHSA-gc5v-m9x4-r6x2), python-dotenv 1.2.4 (GHSA-mf9w-mj56-hr94), and Flask 3.1.3 (GHSA-68rp-wp8r-4726). The native plugin does not use them.
-- Fixed the CodeQL alerts in the legacy Python tools:
-  - The SVG viewer and update stream now use the server's own file names instead of the request's, and the viewer renders a fixed template.
-  - Errors from `/progress` and the diagnostics pages no longer return exception text. The details go to the server log.
-  - The printer TLS context refuses protocols older than TLS 1.2, matching the native plugin.
-
-## 0.3.0
-
 ### Added
 
 - Self-contained native plugin: live telemetry entirely inside OBS as a single DLL that needs only OBS and Windows.
@@ -54,3 +44,11 @@ All notable changes to Bambu2OBS will be documented here.
 - Successful SD-card previews are no longer downloaded again every retry interval.
 - SVG output respects an absolute or custom `BASE_DIR`.
 - Progress-server startup is checked and subprocess shutdown is bounded.
+
+### Security
+
+- Updated the legacy Python tools' dependencies to fix the open Dependabot alerts: requests 2.34.2 (GHSA-gc5v-m9x4-r6x2), python-dotenv 1.2.4 (GHSA-mf9w-mj56-hr94), and Flask 3.1.3 (GHSA-68rp-wp8r-4726). The native plugin does not use them.
+- Fixed the CodeQL alerts in the legacy Python tools:
+  - The SVG viewer and update stream now use the server's own file names instead of the request's, and the viewer renders a fixed template.
+  - Errors from `/progress` and the diagnostics pages no longer return exception text. The details go to the server log.
+  - The printer TLS context refuses protocols older than TLS 1.2, matching the native plugin.
