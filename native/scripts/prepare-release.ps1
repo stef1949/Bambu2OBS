@@ -43,12 +43,19 @@ if ($buildSpecVersion -ne $version -or $cmakeVersion -ne $version) {
     throw "Tag $Tag does not match the source: native/buildspec.json is $buildSpecVersion and native/CMakeLists.txt is $cmakeVersion."
 }
 
+$changelogLines = Get-Content -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md') -Encoding UTF8
+$versionHeading = '^## \[?' + [regex]::Escape($version) + '\]?(\s|$)'
+# The notes come from one section, so a second heading would silently drop its entries.
+$headingCount = @($changelogLines -match $versionHeading).Count
+if ($headingCount -gt 1) {
+    throw "CHANGELOG.md has $headingCount '## $version' headings. Merge them into one before tagging."
+}
 $changes = [Collections.Generic.List[string]]::new()
 $inSection = $false
-foreach ($line in (Get-Content -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md') -Encoding UTF8)) {
+foreach ($line in $changelogLines) {
     if ($line -match '^## ') {
         if ($inSection) { break }
-        $inSection = $line -match ('^## \[?' + [regex]::Escape($version) + '\]?(\s|$)')
+        $inSection = $line -match $versionHeading
         continue
     }
     if ($inSection) { $changes.Add($line) }
